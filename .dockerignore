@@ -1,0 +1,29 @@
+# Secrets. .env carries live API keys; it must never enter the build
+# context, let alone get baked into an image layer or the build cache.
+.env
+.env.*
+!.env.example
+
+# Version control and its metadata.
+.git
+.gitignore
+
+# Local build output and editor/session state — none of it is a build input.
+bin/
+*.swp
+
+# Editor/agent session state. mind.mv2 alone is tens of megabytes and has
+# nothing to do with building the binary.
+.claude/
+
+# Planning and spec docs, human-facing docs, deployment scaffolding, and dev
+# scripts: none of it is read by `go build ./cmd/viiwork-gateway`.
+.superpowers/
+docs/
+scripts/
+caddy/
+README.md
+Dockerfile
+.dockerignore
+docker-compose.yaml
+docker-compose.override.yaml

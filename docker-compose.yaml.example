@@ -1,0 +1,16 @@
+# Copy to docker-compose.yaml and edit. The gateway needs a .env beside it
+# (copy .env.example) carrying VIIWORK_GW_SEEDS and one VIIWORK_KEY_<label>
+# per client.
+services:
+  gateway:
+    build: .
+    image: viiwork-gateway:latest
+    container_name: viiwork-gateway
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Inside the container the listener must bind all interfaces; the
+      # published port below is what keeps it loopback-only on the host.
+      VIIWORK_GW_LISTEN: 0.0.0.0:8090
+    ports:
+      - "127.0.0.1:8090:8090"

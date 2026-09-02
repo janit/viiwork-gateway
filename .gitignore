@@ -1,0 +1,19 @@
+# Secrets — real keys live here, only .env.example is tracked
+.env
+
+# Build output
+bin/
+
+# Local deployment overrides
+docker-compose.override.yaml
+
+.claude/
+*.swp
+docs/security/.report-*.md
+docs/security/.hardening-ledger.md
+
+# Agent tooling. Local working state, never part of the project. publish-lib
+# already refuses to publish .serena/ and .claude/; ignoring them here is what
+# keeps `git status` clean enough for the publish pre-flight to run at all.
+.serena/
+.superpowers/

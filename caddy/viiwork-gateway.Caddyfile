@@ -1,0 +1,76 @@
+# Import this from the host's Caddyfile, or paste it in:
+#
+#     import /etc/caddy/viiwork-gateway.Caddyfile
+#
+# Replace gw.example.com with your own hostname. Caddy obtains and renews the
+# certificate itself.
+#
+# IMPORTANT — the import must be the FIRST line of /etc/caddy/Caddyfile.
+# The block below opens with Caddy's global options, and Caddy rejects a
+# global options block that is not first:
+#
+#     Error: adapting config using caddyfile: server block without any key is
+#     global configuration, and if used, it must be first
+#
+# If you already have site blocks above it, don't move them — instead delete
+# the global options block from this file and merge its `servers { timeouts }`
+# stanza into the global options block you already have at the top of your
+# Caddyfile.
+#
+# Verify whatever you end up with actually applied, rather than assuming:
+#
+#     caddy validate --config /etc/caddy/Caddyfile
+#     caddy adapt --config /etc/caddy/Caddyfile | grep -E 'read_timeout|idle_timeout'
+
+{
+	servers {
+		timeouts {
+			# Defence in depth behind the gateway's own limits. The gateway
+			# bounds its body reads itself (VIIWORK_GW_BODY_READ_TIMEOUT, and
+			# a per-request read deadline in internal/proxy) because a
+			# gateway that is only safe when fronted by a correctly
+			# configured proxy is not safe. These are the second layer: a
+			# stalled request dies at Caddy without ever occupying a
+			# goroutine, an FD and a concurrency token in the gateway.
+
+			# Whole-request read, headers plus body. Matches the gateway's
+			# own 30s VIIWORK_GW_BODY_READ_TIMEOUT default — keep the two in
+			# step if you change either, or the looser one is doing nothing.
+			read_body 30s
+
+			# Headers alone. Mirrors the gateway's ReadHeaderTimeout.
+			read_header 10s
+
+			# An idle keep-alive connection holding no request.
+			idle 5m
+
+			# DO NOT set `write` here.
+			#
+			# A write timeout is a deadline on sending the RESPONSE, and this
+			# gateway's responses are token streams and SSE that legitimately
+			# run for as long as a generation takes — minutes, sometimes
+			# longer. Setting it truncates real inference mid-answer, and the
+			# failure looks like a flaky model rather than a proxy timeout.
+			# This is the same reason the gateway's own http.Server sets
+			# WriteTimeout: 0. Read deadlines are safe; write deadlines are
+			# not.
+		}
+	}
+}
+
+gw.example.com {
+	# Backstop for the gateway's own VIIWORK_GW_MAX_BODY (default 16MB).
+	# Deliberately set ABOVE it, so an oversized body is normally rejected by
+	# the gateway with its OpenAI-shaped 413 that clients can parse, and only
+	# something far outside the expected range is cut off here by Caddy's
+	# blunter 413. Raise this if you raise VIIWORK_GW_MAX_BODY.
+	request_body {
+		max_size 20MB
+	}
+
+	reverse_proxy 127.0.0.1:8090 {
+		# Token streaming and all three SSE endpoints must not be buffered.
+		# The gateway sets this on its own hop too; both are required.
+		flush_interval -1
+	}
+}
