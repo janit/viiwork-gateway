@@ -1,4 +1,4 @@
-.PHONY: build test race docker up down clean
+.PHONY: build test race docker up down deploy clean
 
 build:
 	go build -trimpath -o bin/viiwork-gateway ./cmd/viiwork-gateway
@@ -20,6 +20,11 @@ up:
 
 down:
 	docker compose down
+
+# Deploy runs ON the deployment host, from a published tag.
+# See scripts/deploy.sh --help.
+deploy:
+	./scripts/deploy.sh --latest
 
 clean:
 	rm -rf bin/
