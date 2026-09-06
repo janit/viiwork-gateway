@@ -458,3 +458,99 @@ func newEmptyRouter(t *testing.T) *Router {
 // in-flight cap itself, so pre-existing routing assertions keep behaving as
 // if there were no cap at all.
 const highTestMaxInFlight = 10000
+
+// TestRouterServesMeshPageAtLandingPath proves a GET of the bare hostname is
+// answered by the node's fleet-wide mesh page, not its single-node dashboard.
+func TestRouterServesMeshPageAtLandingPath(t *testing.T) {
+	var seen []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.URL.RequestURI())
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, "<title>mesh</title>")
+	}))
+	defer upstream.Close()
+
+	rt := newTestRouter(t, upstream)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/", nil)
+	rt.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if len(seen) != 1 || seen[0] != "/mesh" {
+		t.Fatalf("node saw %v, want [/mesh]", seen)
+	}
+
+	// The rewrite is upstream-only. The access log wraps this router and
+	// reads r.URL.Path after it returns, so an in-place mutation here would
+	// hide which URL the client actually asked for.
+	if req.URL.Path != "/" {
+		t.Errorf("inbound request path = %q, want it left as %q", req.URL.Path, "/")
+	}
+
+	// No redirect: the browser keeps the bare hostname in its address bar.
+	if loc := rec.Header().Get("Location"); loc != "" {
+		t.Errorf("Location = %q, want no redirect", loc)
+	}
+}
+
+// TestRouterLandingRewritePreservesQueryAndIsGETOnly proves the rewrite
+// touches nothing but the path, and only for the method the node itself
+// serves the page on — a POST to "/" must keep reaching the node as "/" and
+// get the node's own answer (a 404), not be quietly turned into a page load.
+func TestRouterLandingRewritePreservesQueryAndIsGETOnly(t *testing.T) {
+	var seen []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Method+" "+r.URL.RequestURI())
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	rt := newTestRouter(t, upstream)
+
+	rt.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/?tab=hosts", nil))
+	rt.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/", strings.NewReader("{}")))
+	rt.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/mesh", nil))
+
+	want := []string{"GET /mesh?tab=hosts", "POST /", "GET /mesh"}
+	if len(seen) != len(want) {
+		t.Fatalf("node saw %v, want %v", seen, want)
+	}
+	for i := range want {
+		if seen[i] != want[i] {
+			t.Errorf("request %d: node saw %q, want %q", i, seen[i], want[i])
+		}
+	}
+}
+
+// TestRouterPreservesQueryOnModelRoutedPath guards the one thing viiwork's
+// ?host= pin (v1.8.0) depends on from this side: the gateway forwards the
+// inference query string to the node untouched.
+//
+// Nothing in routeByModel sets out to alter the query — but it does rebuild
+// the request body around readBody, and this path is the only one where a
+// dropped parameter would be invisible here and surface far away, as "pinning
+// a model to a host silently does not hold". The auth layer's own
+// TestCredentialsStrippedBeforeForwarding covers the other half: ?key= is
+// removed while unrelated parameters survive.
+func TestRouterPreservesQueryOnModelRoutedPath(t *testing.T) {
+	var seen string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.URL.RequestURI()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	rt := newTestRouter(t, upstream)
+	rec := httptest.NewRecorder()
+	rt.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions?host=gb2",
+		strings.NewReader(`{"model":"gemma"}`)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if want := "/v1/chat/completions?host=gb2"; seen != want {
+		t.Errorf("node saw %q, want %q", seen, want)
+	}
+}

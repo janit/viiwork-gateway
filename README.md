@@ -7,6 +7,7 @@ viiwork has no authentication of its own — by design, for trusted local networ
 ## What it does
 
 - **One origin for the whole mesh.** Inference API and dashboards, same hostname.
+- **Lands on the mesh view.** The bare hostname serves the fleet-wide `/mesh` page, not the single-node dashboard a viiwork node answers `/` with. The rewrite is upstream-only, so the browser keeps `/` in its address bar and the access log still records the path that was asked for. The per-node dashboard is not reachable through the gateway; it stays on the tailnet.
 - **Discovers the fleet.** Seeds are entry points, not the world: every other node is found by polling, and a host that comes up is usable within one poll interval with no restart and no config edit.
 - **Routes by model.** `/v1/chat/completions` goes straight to a node that serves the requested model, one hop instead of two.
 - **Aggregates the catalogue.** `/v1/models` is the union across every discovered node, which is more complete than any single node's view.
@@ -48,7 +49,7 @@ curl https://gw.example.com/v1/chat/completions \
 From a browser, visit once with the key appended:
 
 ```
-https://gw.example.com/mesh?key=YOUR_API_KEY
+https://gw.example.com/?key=YOUR_API_KEY
 ```
 
 The gateway sets a session cookie and redirects to the clean URL. The cookie is signed with that key and expires; deleting the key from `.env` invalidates it immediately.

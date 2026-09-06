@@ -40,6 +40,15 @@ type modelList struct {
 // so this only matters for a caller — e.g. a test — that passes 0).
 const defaultMaxInFlight = 256
 
+// landingPath is the gateway's own front door, and meshPagePath is the
+// fleet-wide mesh view on a viiwork node. Neither is in meshapi: that package
+// covers what nodes say to each other, and these are the node's HTML pages.
+// A GET of the first is served by the second — see ServeHTTP.
+const (
+	landingPath  = "/"
+	meshPagePath = "/mesh"
+)
+
 // defaultBodyReadTimeout is the fallback used when NewRouter is given a
 // non-positive bodyReadTimeout (defensive: config.Load's own default is
 // 30s, so this only matters for a caller — e.g. a test — that passes 0).
@@ -168,6 +177,21 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && isInferencePath(r.URL.Path):
 		rt.routeByModel(w, r)
 
+	// Landing page. The bare hostname serves the fleet-wide mesh view, not
+	// the single-node dashboard a viiwork node answers "/" with — through
+	// this gateway the mesh is the thing worth looking at, and a dashboard
+	// scoped to whichever node happened to be the view node is a confusing
+	// front door. The rewrite is upstream-only: the browser keeps "/" in its
+	// address bar, and because rewritePath leaves the inbound request alone,
+	// the access log still records the path the client actually asked for.
+	//
+	// GET only, matching the node's own handler, so nothing that would have
+	// 404ed upstream starts succeeding here. The node's single-node
+	// dashboard is deliberately not reachable through the gateway any more;
+	// it stays available on the tailnet.
+	case r.Method == http.MethodGet && r.URL.Path == landingPath:
+		rt.routeToView(w, rewritePath(r, meshPagePath))
+
 	// Sticky. Everything per-node: request ids are per-node and
 	// /v1/mesh/prompt?addr= is validated against that node's own peer list.
 	default:
@@ -202,6 +226,24 @@ func isInferencePath(p string) bool {
 	return p == meshapi.PathChatCompletions ||
 		p == meshapi.PathCompletions ||
 		p == meshapi.PathEmbeddings
+}
+
+// rewritePath returns a request that will be forwarded to the node as path p,
+// leaving r itself untouched. The copy matters: the access log wraps this
+// router and reads r.URL.Path *after* the handler returns, and r.WithContext
+// down the forwarding path shares the same *url.URL pointer — so mutating the
+// path in place would silently rewrite the log line too, and the operator
+// would never see which URL the client actually requested. Clone deep-copies
+// the URL (and the headers), so the only thing the node sees differently is
+// the path.
+func rewritePath(r *http.Request, p string) *http.Request {
+	out := r.Clone(r.Context())
+	out.URL.Path = p
+	// RawPath is only consulted when it is a *different* encoding of Path;
+	// carrying the old one over would have the proxy send the pre-rewrite
+	// path on the wire.
+	out.URL.RawPath = ""
+	return out
 }
 
 func (rt *Router) serveModels(w http.ResponseWriter) {
