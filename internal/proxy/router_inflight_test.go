@@ -8,32 +8,14 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/janit/viiwork-gateway/internal/mesh"
 )
 
 // newTestRouterWithMaxInFlight is like newTestRouter but lets the test pick
 // the concurrency cap instead of the "may as well be unlimited" default.
 func newTestRouterWithMaxInFlight(t *testing.T, upstream *httptest.Server, maxInFlight int) *Router {
 	t.Helper()
-	reg := mesh.New(mesh.Options{
-		Seeds:          []string{addrOf(upstream)},
-		Timeout:        time.Second,
-		DiscoveryEvery: 1,
-	})
-	reg.SetSnapshotForTest(mesh.BuildSnapshot(map[string]*mesh.Node{
-		addrOf(upstream): {
-			Addr:            addrOf(upstream),
-			Models:          []string{"gemma"},
-			Healthy:         true,
-			HealthyBackends: 1,
-			InFlight:        0,
-			InFlightKnown:   true,
-			FullUI:          true,
-			Seed:            true,
-		},
-	}, ""))
-	return NewRouter(reg, NewForwarder(nil), 16*1024*1024, maxInFlight, 30*time.Second, nil, nil)
+	fl := upstreamFleet(upstream)
+	return NewRouter(fl, NewForwarder(nil), 16*1024*1024, maxInFlight, 30*time.Second, nil, nil)
 }
 
 // newUnreachableTestRouter builds a router whose only node is a
@@ -42,20 +24,8 @@ func newTestRouterWithMaxInFlight(t *testing.T, upstream *httptest.Server, maxIn
 func newUnreachableTestRouter(t *testing.T, maxInFlight int) *Router {
 	t.Helper()
 	const unreachable = "127.0.0.1:1"
-	reg := mesh.New(mesh.Options{Seeds: []string{unreachable}, Timeout: time.Second, DiscoveryEvery: 1})
-	reg.SetSnapshotForTest(mesh.BuildSnapshot(map[string]*mesh.Node{
-		unreachable: {
-			Addr:            unreachable,
-			Models:          []string{"gemma"},
-			Healthy:         true,
-			HealthyBackends: 1,
-			InFlight:        0,
-			InFlightKnown:   true,
-			FullUI:          true,
-			Seed:            true,
-		},
-	}, ""))
-	return NewRouter(reg, NewForwarder(nil), 16*1024*1024, maxInFlight, 30*time.Second, nil, nil)
+	fl := oneNodeFleet("node-a", unreachable)
+	return NewRouter(fl, NewForwarder(nil), 16*1024*1024, maxInFlight, 30*time.Second, nil, nil)
 }
 
 // TestRouterInFlightCapRejectsOverflowAndReleasesOnCompletion is the core
@@ -138,22 +108,31 @@ func TestRouterInFlightCapRejectsOverflowAndReleasesOnCompletion(t *testing.T) {
 	}
 }
 
-// TestRouterModelsCatalogueNotGatedByInFlightCap proves GET /v1/models is
-// answered locally and is never subject to the concurrency cap: it must
-// succeed even when every token is held.
-func TestRouterModelsCatalogueNotGatedByInFlightCap(t *testing.T) {
+// TestRouterModelsCatalogueTakesAnInFlightToken is MD1. A v2 node's own
+// /v1/models is already the union across alive members and includes aliases,
+// so the gateway forwards the catalogue to the view node instead of building
+// it locally. That makes it a real upstream request holding a real connection,
+// so unlike the power-path deny below it counts against the concurrency cap.
+func TestRouterModelsCatalogueTakesAnInFlightToken(t *testing.T) {
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-release
 		w.WriteHeader(http.StatusOK)
 	}))
+	// Ordered so the blocked upstream is always let go before Close waits on
+	// it, however this test exits.
 	defer upstream.Close()
+	defer releaseAll()
 
 	rt := newTestRouterWithMaxInFlight(t, upstream, 1)
 
-	// Hold the sole token with a blocked inference request.
 	holding := make(chan struct{})
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		rec := httptest.NewRecorder()
 		close(holding)
 		rt.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gemma"}`)))
@@ -163,11 +142,19 @@ func TestRouterModelsCatalogueNotGatedByInFlightCap(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	rt.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("/v1/models while cap exhausted: status = %d, want 200", rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("/v1/models while the cap is exhausted: status = %d, want 503", rec.Code)
 	}
 
-	close(release)
+	releaseAll()
+	<-done
+
+	// With the token back, the catalogue is served by the view node.
+	rec = httptest.NewRecorder()
+	rt.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("/v1/models with a free token: status = %d, want 200", rec.Code)
+	}
 }
 
 // TestRouterPowerDenyNotGatedByInFlightCap proves the power-path 403 deny

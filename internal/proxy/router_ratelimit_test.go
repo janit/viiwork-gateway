@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/janit/viiwork-gateway/internal/auth"
-	"github.com/janit/viiwork-gateway/internal/mesh"
 	"github.com/janit/viiwork-gateway/internal/ratelimit"
 )
 
@@ -19,24 +18,8 @@ import (
 // so the concurrency cap never confounds a rate-limiting assertion.
 func newTestRouterWithLimiter(t *testing.T, upstream *httptest.Server, limiter *ratelimit.Limiter) *Router {
 	t.Helper()
-	reg := mesh.New(mesh.Options{
-		Seeds:          []string{addrOf(upstream)},
-		Timeout:        time.Second,
-		DiscoveryEvery: 1,
-	})
-	reg.SetSnapshotForTest(mesh.BuildSnapshot(map[string]*mesh.Node{
-		addrOf(upstream): {
-			Addr:            addrOf(upstream),
-			Models:          []string{"gemma"},
-			Healthy:         true,
-			HealthyBackends: 1,
-			InFlight:        0,
-			InFlightKnown:   true,
-			FullUI:          true,
-			Seed:            true,
-		},
-	}, ""))
-	return NewRouter(reg, NewForwarder(nil), 16*1024*1024, 256, 30*time.Second, limiter, nil)
+	fl := upstreamFleet(upstream)
+	return NewRouter(fl, NewForwarder(nil), 16*1024*1024, 256, 30*time.Second, limiter, nil)
 }
 
 // inferenceRequest returns a POST that routes by model, authenticated as
@@ -211,15 +194,9 @@ func TestRouterRateLimitIsCheckedBeforeTheBodyIsRead(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer upstream.Close()
 
-	reg := mesh.New(mesh.Options{Seeds: []string{addrOf(upstream)}, Timeout: time.Second, DiscoveryEvery: 1})
-	reg.SetSnapshotForTest(mesh.BuildSnapshot(map[string]*mesh.Node{
-		addrOf(upstream): {
-			Addr: addrOf(upstream), Models: []string{"gemma"}, Healthy: true,
-			HealthyBackends: 1, InFlightKnown: true, FullUI: true, Seed: true,
-		},
-	}, ""))
+	fl := upstreamFleet(upstream)
 	// maxBody of 32 bytes: any real body exceeds it.
-	rt := NewRouter(reg, NewForwarder(nil), 32, 256, 30*time.Second, ratelimit.New(60, 1), nil)
+	rt := NewRouter(fl, NewForwarder(nil), 32, 256, 30*time.Second, ratelimit.New(60, 1), nil)
 
 	rt.ServeHTTP(httptest.NewRecorder(), inferenceRequest("alice", `{"model":"gemma"}`))
 
@@ -244,15 +221,9 @@ func TestRouterRateLimitedRequestConsumesNoInFlightToken(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	reg := mesh.New(mesh.Options{Seeds: []string{addrOf(upstream)}, Timeout: time.Second, DiscoveryEvery: 1})
-	reg.SetSnapshotForTest(mesh.BuildSnapshot(map[string]*mesh.Node{
-		addrOf(upstream): {
-			Addr: addrOf(upstream), Models: []string{"gemma"}, Healthy: true,
-			HealthyBackends: 1, InFlightKnown: true, FullUI: true, Seed: true,
-		},
-	}, ""))
+	fl := upstreamFleet(upstream)
 	// A cap of exactly 1 makes a single leaked token fatal and obvious.
-	rt := NewRouter(reg, NewForwarder(nil), 16*1024*1024, 1, 30*time.Second, ratelimit.New(60, 1), nil)
+	rt := NewRouter(fl, NewForwarder(nil), 16*1024*1024, 1, 30*time.Second, ratelimit.New(60, 1), nil)
 
 	rt.ServeHTTP(httptest.NewRecorder(), inferenceRequest("alice", `{"model":"gemma"}`))
 	for range 50 {

@@ -16,23 +16,20 @@ import (
 	"time"
 
 	"github.com/janit/viiwork-gateway/internal/auth"
-	"github.com/janit/viiwork-gateway/internal/mesh"
+	"github.com/janit/viiwork-gateway/internal/fleet"
 	"github.com/janit/viiwork-gateway/internal/ratelimit"
-	"github.com/janit/viiwork/meshapi"
+	"github.com/janit/viiwork/v2/meshapi"
 )
 
-// modelEntry and modelList are the OpenAI catalogue shape. They are declared
-// here rather than taken from meshapi because they are OpenAI's contract, not
-// the mesh's — meshapi covers what nodes say to each other.
-type modelEntry struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	OwnedBy string `json:"owned_by"`
-}
-
-type modelList struct {
-	Object string       `json:"object"`
-	Data   []modelEntry `json:"data"`
+// Fleet is the gateway's membership, seen as the two decisions the router
+// needs. *fleet.Fleet satisfies it; the tests use a scripted fake.
+type Fleet interface {
+	// Pick chooses a node to serve model, and returns a release func to call
+	// exactly once when the forward ends. ok is false when no member serves
+	// that model, in which case the request goes to the view node.
+	Pick(model string, exclude map[string]bool) (fleet.Target, func(), bool)
+	// View chooses the node that serves the dashboards and the catalogue.
+	View() (fleet.Target, bool)
 }
 
 // defaultMaxInFlight is the fallback used when NewRouter is given a
@@ -56,7 +53,7 @@ const defaultBodyReadTimeout = 30 * time.Second
 
 // Router decides which node answers a request.
 type Router struct {
-	reg     *mesh.Registry
+	fl      Fleet
 	fwd     *Forwarder
 	maxBody int64
 	log     *slog.Logger
@@ -96,7 +93,7 @@ type Router struct {
 // take to arrive (see Router.bodyReadTimeout); a non-positive value falls
 // back to defaultBodyReadTimeout. limiter meters the model-routed path per
 // API key and may be nil, meaning unmetered.
-func NewRouter(reg *mesh.Registry, fwd *Forwarder, maxBody int64, maxInFlight int, bodyReadTimeout time.Duration, limiter *ratelimit.Limiter, logger *slog.Logger) *Router {
+func NewRouter(fl Fleet, fwd *Forwarder, maxBody int64, maxInFlight int, bodyReadTimeout time.Duration, limiter *ratelimit.Limiter, logger *slog.Logger) *Router {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -107,7 +104,7 @@ func NewRouter(reg *mesh.Registry, fwd *Forwarder, maxBody int64, maxInFlight in
 		bodyReadTimeout = defaultBodyReadTimeout
 	}
 	return &Router{
-		reg:             reg,
+		fl:              fl,
 		fwd:             fwd,
 		maxBody:         maxBody,
 		log:             logger,
@@ -168,10 +165,13 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"chassis power control is not available through the gateway; use the tailnet",
 			"forbidden_path")
 
-	// Aggregated. Answered here, because a node's own catalogue is only as
-	// complete as that node's peer configuration.
-	case r.URL.Path == meshapi.PathModels && r.Method == http.MethodGet:
-		rt.serveModels(w)
+	// Denied. The alias table is mesh-wide state: a write here would
+	// repoint every node's traffic for a model name, from outside the
+	// tailnet, with nothing but an API key behind it.
+	case isAliasWrite(r.Method, r.URL.Path):
+		secureError(w, http.StatusForbidden,
+			"alias writes are not available through the gateway; use viiwork alias on the tailnet",
+			"forbidden_path")
 
 	// Model-routed.
 	case r.Method == http.MethodPost && isInferencePath(r.URL.Path):
@@ -222,6 +222,34 @@ func isPowerPath(p string) bool {
 	return strings.EqualFold(cleaned, meshapi.PathPower) || strings.EqualFold(cleaned, meshapi.PathMeshPower)
 }
 
+// isAliasWrite reports whether a request would change the mesh-wide alias
+// table. It is evaluated on the same normalised form as isPowerPath, for the
+// same reason: a node's HTTP stack may resolve "//v1/aliases/x" or
+// "/v1/aliases/x/" down to a path this gateway compared byte-for-byte and
+// waved through.
+//
+// Unlike isPowerPath this is a prefix match, because every alias write is
+// addressed below /v1/aliases — /v1/aliases/<name> and
+// /v1/aliases/<name>/revert. And it denies every method that is not a read,
+// rather than listing the writes: a verb a later node version adds is denied
+// by default rather than admitted by omission.
+func isAliasWrite(method, p string) bool {
+	if method == http.MethodGet || method == http.MethodHead {
+		return false
+	}
+	cleaned := path.Clean(p)
+	if cleaned != "/" {
+		cleaned = strings.TrimSuffix(cleaned, "/")
+	}
+	return strings.EqualFold(cleaned, meshapi.PathAliases) ||
+		hasPrefixFold(cleaned, meshapi.PathAliases+"/")
+}
+
+// hasPrefixFold is strings.HasPrefix, case-insensitively.
+func hasPrefixFold(s, prefix string) bool {
+	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
+}
+
 func isInferencePath(p string) bool {
 	return p == meshapi.PathChatCompletions ||
 		p == meshapi.PathCompletions ||
@@ -244,17 +272,6 @@ func rewritePath(r *http.Request, p string) *http.Request {
 	// path on the wire.
 	out.URL.RawPath = ""
 	return out
-}
-
-func (rt *Router) serveModels(w http.ResponseWriter) {
-	ids := rt.reg.Snapshot().ModelIDs()
-	out := modelList{Object: "list", Data: make([]modelEntry, 0, len(ids))}
-	for _, id := range ids {
-		out.Data = append(out.Data, modelEntry{ID: id, Object: "model", OwnedBy: "viiwork"})
-	}
-	setSecurityHeaders(w.Header())
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(out)
 }
 
 func (rt *Router) routeByModel(w http.ResponseWriter, r *http.Request) {
@@ -321,23 +338,76 @@ func (rt *Router) routeByModel(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(body, &probe)
 
-	addr, ok := rt.reg.PickForModel(probe.Model)
+	if info := RequestInfoFromContext(r.Context()); info != nil {
+		info.Model = probe.Model
+	}
+
+	target, release, ok := rt.fl.Pick(probe.Model, nil)
 	if !ok {
-		view, haveView := rt.reg.ViewAddr()
+		// No member serves this name: an alias, a pipeline, a model still
+		// loading, or simply an unknown model. The gateway holds no alias
+		// table, so the view node resolves it — or answers 404 or 503.
+		view, haveView := rt.fl.View()
 		if !haveView {
 			rt.log.Warn("no healthy mesh node available", "path", r.URL.Path, "model", probe.Model)
 			secureError(w, http.StatusServiceUnavailable,
 				"no mesh node is currently reachable", "no_healthy_node")
 			return
 		}
-		addr = view
+		rt.setNode(r, view.Node)
+		if err := rt.fwd.To(w, r, view.APIAddr); err != nil {
+			writeUnreachable(w, view.Node)
+		}
+		return
 	}
 
-	if info := RequestInfoFromContext(r.Context()); info != nil {
-		info.Model = probe.Model
-		info.Node = addr
+	rt.setNode(r, target.Node)
+	err = rt.fwd.To(w, r, target.APIAddr)
+	release()
+	if !errors.Is(err, ErrUpstreamUnreachable) {
+		// Either it worked, or it failed in a way that has already been
+		// written to the client. A node's own 429 or 503 arrives here as a
+		// successful forward and passes straight through: the node already
+		// knows about its own queue and spill.
+		return
 	}
-	rt.fwd.To(w, r, addr)
+
+	// The node could not be dialled and nothing was written, so it most
+	// likely left the mesh between two capacity polls. Try once more, on a
+	// different node, with the body rewound.
+	rt.log.Warn("retrying on another node", "path", r.URL.Path,
+		"model", probe.Model, "unreachable", target.Node)
+	resetBody(r, body)
+
+	second, releaseSecond, ok := rt.fl.Pick(probe.Model, map[string]bool{target.Node: true})
+	if !ok {
+		writeUnreachable(w, target.Node)
+		return
+	}
+
+	rt.setNode(r, second.Node)
+	err = rt.fwd.To(w, r, second.APIAddr)
+	releaseSecond()
+	if errors.Is(err, ErrUpstreamUnreachable) {
+		writeUnreachable(w, second.Node)
+	}
+}
+
+// setNode records which node answered, or was last tried, for the access log.
+func (rt *Router) setNode(r *http.Request, node string) {
+	if info := RequestInfoFromContext(r.Context()); info != nil {
+		info.Node = node
+	}
+}
+
+// resetBody rewinds a request body that a spent forward attempt has already
+// consumed, so the retry sends the bytes the client actually posted.
+func resetBody(r *http.Request, body []byte) {
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+	r.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
 }
 
 func (rt *Router) routeToView(w http.ResponseWriter, r *http.Request) {
@@ -350,7 +420,7 @@ func (rt *Router) routeToView(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
-	addr, ok := rt.reg.ViewAddr()
+	view, ok := rt.fl.View()
 	if !ok {
 		rt.log.Warn("no healthy mesh node available", "path", r.URL.Path)
 		secureError(w, http.StatusServiceUnavailable,
@@ -386,10 +456,10 @@ func (rt *Router) routeToView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if info := RequestInfoFromContext(r.Context()); info != nil {
-		info.Node = addr
+	rt.setNode(r, view.Node)
+	if err := rt.fwd.To(w, r, view.APIAddr); err != nil {
+		writeUnreachable(w, view.Node)
 	}
-	rt.fwd.To(w, r, addr)
 }
 
 // readBody buffers the request body — so routeByModel can read the model out

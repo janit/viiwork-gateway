@@ -1,15 +1,12 @@
 package proxy
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/janit/viiwork-gateway/internal/mesh"
 )
 
 func TestRouterDeniesChassisPowerPaths(t *testing.T) {
@@ -207,41 +204,6 @@ func TestRouterLocalResponsesCarrySecurityHeaders(t *testing.T) {
 	})
 }
 
-func TestRouterAggregatesModelsLocally(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("/v1/models must be answered by the gateway, not proxied (got %s)", r.URL.Path)
-	}))
-	defer upstream.Close()
-
-	rt := newTestRouter(t, upstream)
-	rec := httptest.NewRecorder()
-	rt.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-	var got struct {
-		Object string `json:"object"`
-		Data   []struct {
-			ID      string `json:"id"`
-			Object  string `json:"object"`
-			OwnedBy string `json:"owned_by"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatalf("decode: %v (%s)", err, rec.Body.String())
-	}
-	if got.Object != "list" {
-		t.Errorf("object = %q, want list", got.Object)
-	}
-	if len(got.Data) != 1 || got.Data[0].ID != "gemma" {
-		t.Fatalf("data = %+v, want one entry for gemma", got.Data)
-	}
-	if got.Data[0].Object != "model" {
-		t.Errorf("entry object = %q, want model", got.Data[0].Object)
-	}
-}
-
 func TestRouterRoutesByModelInBody(t *testing.T) {
 	var gotPath, gotBody string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -343,12 +305,12 @@ func TestRouterNoHealthyNodesYields503(t *testing.T) {
 		t.Fatalf("model-routed: status = %d, want 503", rec.Code)
 	}
 
-	// /v1/models still answers, with an empty list: the gateway knows the
-	// answer itself and an empty catalogue is the truthful one.
+	// /v1/models is the view node's answer now, not one the gateway builds,
+	// so with no view node there is nothing truthful to say.
 	rec = httptest.NewRecorder()
 	rt.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("/v1/models: status = %d, want 200", rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("/v1/models: status = %d, want 503", rec.Code)
 	}
 }
 
@@ -398,29 +360,8 @@ func newTestRouter(t *testing.T, upstream *httptest.Server) *Router {
 
 func newTestRouterWithMaxBody(t *testing.T, upstream *httptest.Server, maxBody int64) *Router {
 	t.Helper()
-	reg := mesh.New(mesh.Options{
-		Seeds:          []string{addrOf(upstream)},
-		Timeout:        time.Second,
-		DiscoveryEvery: 1,
-	})
-	// Drive the registry with a stub node rather than a real poll: this test
-	// is about routing, not discovery.
-	reg.SetSnapshotForTest(mesh.BuildSnapshot(map[string]*mesh.Node{
-		addrOf(upstream): {
-			Addr:            addrOf(upstream),
-			Models:          []string{"gemma"},
-			Healthy:         true,
-			HealthyBackends: 1,
-			InFlight:        0,
-			InFlightKnown:   true,
-			FullUI:          true,
-			// Seed: true — this stub node is meant to be the view node (see
-			// TestRouterStickyPathsGoToViewNode); view election (F3) now
-			// restricts eligibility to Seed nodes.
-			Seed: true,
-		},
-	}, ""))
-	return NewRouter(reg, NewForwarder(nil), maxBody, highTestMaxInFlight, 30*time.Second, nil, nil)
+	fl := upstreamFleet(upstream)
+	return NewRouter(fl, NewForwarder(nil), maxBody, highTestMaxInFlight, 30*time.Second, nil, nil)
 }
 
 // newTestRouterWithBodyTimeout is like newTestRouter but lets the test pick
@@ -428,30 +369,14 @@ func newTestRouterWithMaxBody(t *testing.T, upstream *httptest.Server, maxBody i
 // production default.
 func newTestRouterWithBodyTimeout(t *testing.T, upstream *httptest.Server, bodyReadTimeout time.Duration) *Router {
 	t.Helper()
-	reg := mesh.New(mesh.Options{
-		Seeds:          []string{addrOf(upstream)},
-		Timeout:        time.Second,
-		DiscoveryEvery: 1,
-	})
-	reg.SetSnapshotForTest(mesh.BuildSnapshot(map[string]*mesh.Node{
-		addrOf(upstream): {
-			Addr:            addrOf(upstream),
-			Models:          []string{"gemma"},
-			Healthy:         true,
-			HealthyBackends: 1,
-			InFlight:        0,
-			InFlightKnown:   true,
-			FullUI:          true,
-			Seed:            true,
-		},
-	}, ""))
-	return NewRouter(reg, NewForwarder(nil), 16*1024*1024, highTestMaxInFlight, bodyReadTimeout, nil, nil)
+	fl := upstreamFleet(upstream)
+	return NewRouter(fl, NewForwarder(nil), 16*1024*1024, highTestMaxInFlight, bodyReadTimeout, nil, nil)
 }
 
 func newEmptyRouter(t *testing.T) *Router {
 	t.Helper()
-	reg := mesh.New(mesh.Options{Seeds: []string{"127.0.0.1:1"}, Timeout: time.Second})
-	return NewRouter(reg, NewForwarder(nil), 16*1024*1024, highTestMaxInFlight, 30*time.Second, nil, nil)
+	fl := emptyFleet()
+	return NewRouter(fl, NewForwarder(nil), 16*1024*1024, highTestMaxInFlight, 30*time.Second, nil, nil)
 }
 
 // highTestMaxInFlight is used by tests that are not exercising the

@@ -3,6 +3,8 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -71,7 +73,7 @@ func TestForwardSetsSecurityHeaders(t *testing.T) {
 
 	f := NewForwarder(nil)
 	rec := httptest.NewRecorder()
-	f.To(rec, httptest.NewRequest("GET", "/", nil), addrOf(upstream))
+	_ = f.To(rec, httptest.NewRequest("GET", "/", nil), addrOf(upstream))
 
 	h := rec.Header()
 	if got := h.Get("X-Content-Type-Options"); got != "nosniff" {
@@ -103,7 +105,7 @@ func TestForwardSecurityHeadersOverrideHostileUpstream(t *testing.T) {
 
 	f := NewForwarder(nil)
 	rec := httptest.NewRecorder()
-	f.To(rec, httptest.NewRequest("GET", "/", nil), addrOf(upstream))
+	_ = f.To(rec, httptest.NewRequest("GET", "/", nil), addrOf(upstream))
 
 	h := rec.Header()
 	if vals := h.Values("X-Frame-Options"); len(vals) != 1 || vals[0] != "DENY" {
@@ -129,40 +131,104 @@ func TestForwardStripsUpstreamSetCookie(t *testing.T) {
 
 	f := NewForwarder(nil)
 	rec := httptest.NewRecorder()
-	f.To(rec, httptest.NewRequest("GET", "/", nil), addrOf(upstream))
+	_ = f.To(rec, httptest.NewRequest("GET", "/", nil), addrOf(upstream))
 
 	if got := rec.Header().Values("Set-Cookie"); len(got) != 0 {
 		t.Errorf("Set-Cookie survived from upstream: %v", got)
 	}
 }
 
-// A hostile node's response is forwarded with an unreachable-upstream style
-// error too (via ErrorHandler) — that locally-generated response must be
-// protected as well.
-func TestForwardErrorResponseCarriesSecurityHeaders(t *testing.T) {
+// FW1: a node that cannot be dialled is handed back to the router, not
+// written to the client. Nothing may be written, because the router is about
+// to try the same request on another node.
+func TestForwardUnreachableIsReportedNotWritten(t *testing.T) {
 	f := NewForwarder(nil)
 	rec := httptest.NewRecorder()
-	f.To(rec, httptest.NewRequest("GET", "/v1/models", nil), "127.0.0.1:1")
+	err := f.To(rec, httptest.NewRequest("GET", "/v1/models", nil), "127.0.0.1:1")
 
-	h := rec.Header()
-	if got := h.Get("X-Content-Type-Options"); got != "nosniff" {
-		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+	if !errors.Is(err, ErrUpstreamUnreachable) {
+		t.Fatalf("To returned %v, want an error wrapping ErrUpstreamUnreachable", err)
 	}
-	if got := h.Get("Content-Security-Policy"); got != contentSecurityPolicy {
-		t.Errorf("Content-Security-Policy = %q, want %q", got, contentSecurityPolicy)
+	if rec.Code != http.StatusOK || rec.Body.Len() != 0 {
+		t.Errorf("status %d with %d bytes written; an unreachable node must "+
+			"leave the response untouched so the retry can use it",
+			rec.Code, rec.Body.Len())
+	}
+	if got := rec.Header().Get("Content-Security-Policy"); got != "" {
+		t.Errorf("headers were written too: CSP = %q", got)
 	}
 }
 
-func TestForwardUnreachableUpstreamYields502(t *testing.T) {
+// FW2: a node that accepts the connection and then fails is NOT retryable —
+// the request was already sent, and a generation may have started. That is
+// written as a 502 immediately, with the security headers a locally generated
+// response needs.
+func TestForwardFailureAfterConnectIsWrittenAs502(t *testing.T) {
+	// An upstream that accepts and closes without a response.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+
 	f := NewForwarder(nil)
 	rec := httptest.NewRecorder()
-	f.To(rec, httptest.NewRequest("GET", "/v1/models", nil), "127.0.0.1:1")
-
+	if err := f.To(rec, httptest.NewRequest("GET", "/v1/models", nil), ln.Addr().String()); err != nil {
+		t.Fatalf("To returned %v, want nil: a failure after connect is not retryable", err)
+	}
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", rec.Code)
 	}
 	if !strings.Contains(rec.Body.String(), `"error"`) {
 		t.Errorf("502 should use the OpenAI error shape, got %q", rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+	if got := rec.Header().Get("Content-Security-Policy"); got != contentSecurityPolicy {
+		t.Errorf("Content-Security-Policy = %q, want the gateway's own", got)
+	}
+}
+
+// FW3: a client that hung up gets nothing, and is not an error.
+func TestForwardCancelledClientWritesNothing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	f := NewForwarder(nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/v1/models", nil).WithContext(ctx)
+	if err := f.To(rec, req, "127.0.0.1:1"); err != nil {
+		t.Fatalf("To returned %v, want nil for a cancelled client", err)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("wrote %d bytes to a client that had gone away", rec.Body.Len())
+	}
+}
+
+// writeUnreachable is what the router calls once the retry is spent. It is the
+// 502 that FW1 deliberately did not write.
+func TestWriteUnreachableCarriesSecurityHeaders(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeUnreachable(rec, "node-a")
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "node-a") {
+		t.Errorf("body %q should name the node that could not be reached", rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Security-Policy"); got != contentSecurityPolicy {
+		t.Errorf("Content-Security-Policy = %q, want the gateway's own", got)
 	}
 }
 

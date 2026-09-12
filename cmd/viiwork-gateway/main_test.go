@@ -12,25 +12,28 @@ import (
 	"time"
 
 	"github.com/janit/viiwork-gateway/internal/config"
+	"github.com/janit/viiwork-gateway/internal/fleet"
 	"github.com/janit/viiwork-gateway/internal/keys"
-	"github.com/janit/viiwork-gateway/internal/mesh"
 )
 
 const key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 func testHandler(t *testing.T) http.Handler {
 	t.Helper()
+	return testHandlerWithFleet(t, stubFleet{})
+}
+
+func testHandlerWithFleet(t *testing.T, fl stubFleet) http.Handler {
+	t.Helper()
 	set, err := keys.Load([]string{"VIIWORK_KEY_janit=" + key})
 	if err != nil {
 		t.Fatalf("keys.Load: %v", err)
 	}
 	cfg := config.Config{
-		Seeds:     []string{"127.0.0.1:1"},
 		CookieTTL: time.Hour,
 		MaxBody:   1024,
 	}
-	reg := mesh.New(mesh.Options{Seeds: cfg.Seeds, Timeout: time.Second})
-	return buildHandler(reg, set, cfg, slog.Default())
+	return buildHandler(fl, set, cfg, slog.Default())
 }
 
 // The whole surface is behind authentication. No exceptions, including the
@@ -50,8 +53,23 @@ func TestEveryPathRequiresAKey(t *testing.T) {
 	}
 }
 
+// An authenticated request reaches the mesh. The catalogue is the view node's
+// answer now rather than one the gateway assembles, so this proves the whole
+// chain — auth, logging, routing, forwarding — carries it there and back.
 func TestAuthenticatedModelsRequestSucceeds(t *testing.T) {
-	h := testHandler(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Errorf("view node saw path %q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("credential reached the node: %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+	}))
+	defer upstream.Close()
+
+	h := testHandlerWithFleet(t, fleetAt(strings.TrimPrefix(upstream.URL, "http://")))
 	req := httptest.NewRequest("GET", "/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer "+key)
 	rec := httptest.NewRecorder()
@@ -88,19 +106,7 @@ func TestFullChainSeversStalledStickyBody(t *testing.T) {
 	defer upstream.Close()
 	addr := strings.TrimPrefix(upstream.URL, "http://")
 
-	reg := mesh.New(mesh.Options{Seeds: []string{addr}, Timeout: time.Second, DiscoveryEvery: 1})
-	reg.SetSnapshotForTest(mesh.BuildSnapshot(map[string]*mesh.Node{
-		addr: {
-			Addr:            addr,
-			Models:          []string{"gemma"},
-			Healthy:         true,
-			HealthyBackends: 1,
-			InFlight:        0,
-			InFlightKnown:   true,
-			FullUI:          true,
-			Seed:            true,
-		},
-	}, ""))
+	fl := fleetAt(addr)
 
 	set, err := keys.Load([]string{"VIIWORK_KEY_janit=" + key})
 	if err != nil {
@@ -109,14 +115,13 @@ func TestFullChainSeversStalledStickyBody(t *testing.T) {
 
 	const bodyReadTimeout = 200 * time.Millisecond
 	cfg := config.Config{
-		Seeds:           []string{addr},
 		CookieTTL:       time.Hour,
 		MaxBody:         1024,
 		MaxInFlight:     10,
 		BodyReadTimeout: bodyReadTimeout,
 	}
 
-	h := buildHandler(reg, set, cfg, slog.Default())
+	h := buildHandler(fl, set, cfg, slog.Default())
 	gw := httptest.NewServer(h)
 	defer gw.Close()
 
@@ -214,7 +219,6 @@ func TestFullChainRateLimitsPerKeyNotGlobally(t *testing.T) {
 	addr := strings.TrimPrefix(upstream.URL, "http://")
 
 	cfg := config.Config{
-		Seeds:           []string{addr},
 		CookieTTL:       time.Hour,
 		MaxBody:         1 << 20,
 		MaxInFlight:     256,
@@ -222,14 +226,8 @@ func TestFullChainRateLimitsPerKeyNotGlobally(t *testing.T) {
 		RatePerMin:      60,
 		RateBurst:       2,
 	}
-	reg := mesh.New(mesh.Options{Seeds: cfg.Seeds, Timeout: time.Second, DiscoveryEvery: 1})
-	reg.SetSnapshotForTest(mesh.BuildSnapshot(map[string]*mesh.Node{
-		addr: {
-			Addr: addr, Models: []string{"gemma"}, Healthy: true,
-			HealthyBackends: 1, InFlightKnown: true, FullUI: true, Seed: true,
-		},
-	}, ""))
-	h := buildHandler(reg, set, cfg, slog.Default())
+	fl := fleetAt(addr)
+	h := buildHandler(fl, set, cfg, slog.Default())
 
 	post := func(apiKey string) int {
 		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
@@ -274,7 +272,6 @@ func TestFullChainRateLimitCanBeDisabled(t *testing.T) {
 	addr := strings.TrimPrefix(upstream.URL, "http://")
 
 	cfg := config.Config{
-		Seeds:           []string{addr},
 		CookieTTL:       time.Hour,
 		MaxBody:         1 << 20,
 		MaxInFlight:     256,
@@ -282,14 +279,8 @@ func TestFullChainRateLimitCanBeDisabled(t *testing.T) {
 		RatePerMin:      0, // disabled
 		RateBurst:       240,
 	}
-	reg := mesh.New(mesh.Options{Seeds: cfg.Seeds, Timeout: time.Second, DiscoveryEvery: 1})
-	reg.SetSnapshotForTest(mesh.BuildSnapshot(map[string]*mesh.Node{
-		addr: {
-			Addr: addr, Models: []string{"gemma"}, Healthy: true,
-			HealthyBackends: 1, InFlightKnown: true, FullUI: true, Seed: true,
-		},
-	}, ""))
-	h := buildHandler(reg, set, cfg, slog.Default())
+	fl := fleetAt(addr)
+	h := buildHandler(fl, set, cfg, slog.Default())
 
 	for i := range 50 {
 		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
@@ -301,4 +292,23 @@ func TestFullChainRateLimitCanBeDisabled(t *testing.T) {
 			t.Fatalf("request %d: status %d, want 200 with rate limiting disabled", i+1, rec.Code)
 		}
 	}
+}
+
+// stubFleet is a one-node Fleet: these tests exercise the handler pipeline
+// (auth, logging, rate limiting, routing), not the membership behind it.
+type stubFleet struct{ target fleet.Target }
+
+func (f stubFleet) Pick(string, map[string]bool) (fleet.Target, func(), bool) {
+	if f.target.APIAddr == "" {
+		return fleet.Target{}, func() {}, false
+	}
+	return f.target, func() {}, true
+}
+
+func (f stubFleet) View() (fleet.Target, bool) {
+	return f.target, f.target.APIAddr != ""
+}
+
+func fleetAt(addr string) stubFleet {
+	return stubFleet{target: fleet.Target{Node: "node-a", APIAddr: addr}}
 }

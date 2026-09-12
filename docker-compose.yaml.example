@@ -1,16 +1,29 @@
-# Copy to docker-compose.yaml and edit. The gateway needs a .env beside it
-# (copy .env.example) carrying VIIWORK_GW_SEEDS and one VIIWORK_KEY_<label>
-# per client.
 services:
   gateway:
-    build: .
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
     image: viiwork-gateway:latest
     container_name: viiwork-gateway
     restart: unless-stopped
     env_file: .env
+    # Host networking, because mesh gossip must be reachable on this host's
+    # tailnet address and must never appear on a public interface. A bridged
+    # container advertises an address no other member can reach.
+    network_mode: host
     environment:
-      # Inside the container the listener must bind all interfaces; the
-      # published port below is what keeps it loopback-only on the host.
-      VIIWORK_GW_LISTEN: 0.0.0.0:8090
-    ports:
-      - "127.0.0.1:8090:8090"
+      # With host networking the gateway binds loopback directly: there is no
+      # published port doing it for us any more. Caddy remains the only way in.
+      VIIWORK_GW_LISTEN: 127.0.0.1:8090
+    volumes:
+      # The tailscaled socket, for resolving this host's tailnet address and
+      # discovering members. Mounted as a directory, not a file: a socket file
+      # bind-mount goes stale when tailscaled restarts.
+      - /var/run/tailscale:/var/run/tailscale:ro
+    # If the nonroot user cannot open the tailscaled socket — its permissions
+    # differ by distribution — drop the volume and the tailnet feeder, and name
+    # the address and the seeds instead:
+    #   VIIWORK_GW_MESH_TAILNET: "false"
+    #   VIIWORK_GW_MESH_ADVERTISE: 100.64.0.9
+    #   VIIWORK_GW_MESH_SEEDS: 100.64.0.2:7946,100.64.0.3:7946

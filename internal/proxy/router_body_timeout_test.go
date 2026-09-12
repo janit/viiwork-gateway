@@ -9,8 +9,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/janit/viiwork-gateway/internal/mesh"
 )
 
 // TestRouterSeversSlowBodyInBoundedTime is the direct reproduction of R2:
@@ -252,22 +250,10 @@ func TestRouterStickyPathTimedOutBodyReleasesToken(t *testing.T) {
 	defer upstream.Close()
 
 	addr := strings.TrimPrefix(upstream.URL, "http://")
-	reg := mesh.New(mesh.Options{Seeds: []string{addr}, Timeout: time.Second, DiscoveryEvery: 1})
-	reg.SetSnapshotForTest(mesh.BuildSnapshot(map[string]*mesh.Node{
-		addr: {
-			Addr:            addr,
-			Models:          []string{"gemma"},
-			Healthy:         true,
-			HealthyBackends: 1,
-			InFlight:        0,
-			InFlightKnown:   true,
-			FullUI:          true,
-			Seed:            true,
-		},
-	}, ""))
+	fl := oneNodeFleet("node-a", addr)
 
 	const bodyReadTimeout = 200 * time.Millisecond
-	rt := NewRouter(reg, NewForwarder(nil), 16*1024*1024, 1, bodyReadTimeout, nil, nil)
+	rt := NewRouter(fl, NewForwarder(nil), 16*1024*1024, 1, bodyReadTimeout, nil, nil)
 	gw := httptest.NewServer(rt)
 	defer gw.Close()
 

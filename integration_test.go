@@ -1,430 +1,616 @@
 //go:build integration
 
+// End-to-end over a real viiwork 2 mesh: a gateway that has actually joined,
+// real fake nodes answering real HTTP, and the whole request pipeline in front
+// of it — authentication, the access log, and the router.
 package main_test
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/memberlist"
 	"github.com/janit/viiwork-gateway/internal/accesslog"
 	"github.com/janit/viiwork-gateway/internal/auth"
+	"github.com/janit/viiwork-gateway/internal/config"
+	"github.com/janit/viiwork-gateway/internal/fleet"
 	"github.com/janit/viiwork-gateway/internal/keys"
-	"github.com/janit/viiwork-gateway/internal/mesh"
 	"github.com/janit/viiwork-gateway/internal/proxy"
-	"github.com/janit/viiwork/meshapi"
+	"github.com/janit/viiwork/v2/mesh"
+	"github.com/janit/viiwork/v2/mesh/meshtest"
+	"github.com/janit/viiwork/v2/meshapi"
 )
 
-// syncBuffer is a bytes.Buffer safe for the concurrent writes an
-// slog.Handler can make from more than one in-flight request.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
+const testKey = "integration-test-key-at-least-24-chars"
+
+var loopback = netip.MustParseAddr("127.0.0.1")
+
+func fastTimings(tr *meshtest.Transport) func(*memberlist.Config) {
+	return func(c *memberlist.Config) {
+		c.Transport = tr
+		c.ProbeInterval = 200 * time.Millisecond
+		c.ProbeTimeout = 100 * time.Millisecond
+		c.SuspicionMult = 2
+		c.GossipInterval = 50 * time.Millisecond
+		c.PushPullInterval = 500 * time.Millisecond
+		c.TCPTimeout = 500 * time.Millisecond
+		c.DeadNodeReclaimTime = time.Second
+	}
 }
 
-func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
+// node is a viiwork 2 node: a mesh member plus the API surface the gateway
+// actually reaches through.
+type node struct {
+	name    string
+	mesh    *mesh.Mesh
+	srv     *httptest.Server
+	apiPort int
+
+	mu        sync.Mutex
+	models    []meshapi.ModelCapacity
+	chatHits  int
+	powerHits int
+	hold      time.Duration
+	credLeaks []string
 }
 
-func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
+func (n *node) setModels(m ...meshapi.ModelCapacity) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.models = m
 }
 
-const apiKey = "integration-key-integration-key"
-
-// deadAddr is a peer address that is advertised by a node but never answers:
-// nothing listens on port 1, so a dial to it is refused immediately rather
-// than timing out. It exists to prove the hearsay rule: a peer's report of
-// another node's existence must never make that node routable, or elect it as
-// the view, until it answers its own status poll.
-const deadAddr = "127.0.0.1:1"
-
-// fakeMeshNode is a minimal node answering the meshapi contract. serveChat
-// distinguishes a viiwork node from a viiwork-nvidia one.
-type fakeMeshNode struct {
-	srv       *httptest.Server
-	models    []string
-	serveChat bool
-	peers     []string
-	served    chan string
-	powerHit  chan string
+func (n *node) setHold(d time.Duration) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.hold = d
 }
 
-func newMeshNode(t *testing.T, models []string, serveChat bool) *fakeMeshNode {
+func (n *node) counts() (chat, power int) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.chatHits, n.powerHits
+}
+
+func (n *node) leaks() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]string(nil), n.credLeaks...)
+}
+
+// noteCredentials records anything that should never have left the gateway.
+// The gateway strips credentials before forwarding, so a node's logs and
+// prompt history never carry a gateway key.
+func (n *node) noteCredentials(r *http.Request) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if v := r.Header.Get("Authorization"); v != "" {
+		n.credLeaks = append(n.credLeaks, "Authorization: "+v)
+	}
+	if v := r.Header.Get("Cookie"); v != "" {
+		n.credLeaks = append(n.credLeaks, "Cookie: "+v)
+	}
+}
+
+func model(name string, slots, busy int) meshapi.ModelCapacity {
+	return meshapi.ModelCapacity{
+		Name: name, Engine: "llamacpp", Slots: slots, Busy: busy,
+		Backends: 1, HealthyBackends: 1,
+	}
+}
+
+func (n *node) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n.noteCredentials(r)
+		switch {
+		case r.URL.Path == meshapi.PathCapacity:
+			n.mu.Lock()
+			models := append([]meshapi.ModelCapacity(nil), n.models...)
+			n.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(meshapi.CapacityResponse{
+				Node: n.name, Ver: "v2.0.0-beta1", Models: models,
+			})
+
+		case r.URL.Path == meshapi.PathChatCompletions:
+			n.mu.Lock()
+			n.chatHits++
+			hold := n.hold
+			n.mu.Unlock()
+			if hold > 0 {
+				time.Sleep(hold)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"node":%q,"object":"chat.completion"}`, n.name)
+
+		case r.URL.Path == meshapi.PathPower || r.URL.Path == meshapi.PathMeshPower:
+			n.mu.Lock()
+			n.powerHits++
+			n.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+
+		case r.URL.Path == meshapi.PathModels:
+			fmt.Fprintf(w, `{"object":"list","data":[{"id":"m","owned_by":"local"}],"served_by":%q}`, n.name)
+
+		case r.URL.Path == meshapi.PathAliases:
+			fmt.Fprintf(w, `{"aliases":[{"name":"stable-coder","target":"m"}],"served_by":%q}`, n.name)
+
+		case r.URL.Path == "/mesh":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			fmt.Fprintf(w, `<!doctype html><title>mesh</title><p>served by %s</p>`, n.name)
+
+		default:
+			http.NotFound(w, r)
+		}
+	})
+}
+
+func startNode(t *testing.T, nw *meshtest.Network, name string, gossipPort int, tune func(*mesh.Options)) *node {
 	t.Helper()
-	n := &fakeMeshNode{
-		models:    models,
-		serveChat: serveChat,
-		served:    make(chan string, 64),
-		powerHit:  make(chan string, 8),
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc(meshapi.PathStatus, func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(meshapi.StatusResponse{
-			NodeID:          "node-" + models[0],
-			Hostname:        "host-" + models[0],
-			Models:          models,
-			TotalInFlight:   0,
-			HealthyBackends: 1,
-			TotalBackends:   1,
-		})
-	})
-	mux.HandleFunc(meshapi.PathCluster, func(w http.ResponseWriter, r *http.Request) {
-		peers := make([]meshapi.ClusterPeerInfo, 0, len(n.peers))
-		for _, addr := range n.peers {
-			peers = append(peers, meshapi.ClusterPeerInfo{Addr: addr, Status: meshapi.StatusHealthy})
-		}
-		_ = json.NewEncoder(w).Encode(meshapi.ClusterResponse{NodeID: "node", Peers: peers})
-	})
-	mux.HandleFunc(meshapi.PathChatCompletions, func(w http.ResponseWriter, r *http.Request) {
-		n.served <- models[0]
-		if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
-			http.Error(w, "gateway leaked a credential to the mesh", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"hi"}}]}`))
-	})
-	mux.HandleFunc("/mesh", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
-		_, _ = w.Write([]byte("<html>mesh dashboard</html>"))
-	})
-	// Chassis power control must never reach a mesh node: the gateway
-	// refuses it outright. These handlers exist only so a regression that
-	// forwards it anyway is caught by a recorded hit, not masked by a
-	// coincidental 404 from an unregistered path.
-	mux.HandleFunc(meshapi.PathPower, func(w http.ResponseWriter, r *http.Request) {
-		n.powerHit <- meshapi.PathPower
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc(meshapi.PathMeshPower, func(w http.ResponseWriter, r *http.Request) {
-		n.powerHit <- meshapi.PathMeshPower
-		w.WriteHeader(http.StatusOK)
-	})
-	if serveChat {
-		mux.HandleFunc("/chat", func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "text/html")
-			_, _ = w.Write([]byte("<html>chat</html>"))
-		})
-	}
-
-	n.srv = httptest.NewServer(mux)
+	n := &node{name: name}
+	n.srv = httptest.NewServer(n.handler())
 	t.Cleanup(n.srv.Close)
+
+	_, portStr, err := net.SplitHostPort(n.srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+	n.apiPort, _ = strconv.Atoi(portStr)
+
+	tr := nw.TransportAt(name, netip.AddrPortFrom(loopback, uint16(gossipPort)))
+	o := mesh.Options{
+		Name: name, Network: mesh.NetworkTailnet, BindPort: gossipPort,
+		Advertise: loopback, APIPort: n.apiPort, Role: meshapi.RoleNode,
+		Version: "v2.0.0-beta1", Enforce: mesh.EnforceFull,
+		RejoinInterval: 300 * time.Millisecond,
+		AddrCheck:      func(netip.Addr) error { return nil },
+		Tune:           fastTimings(tr),
+	}
+	if tune != nil {
+		tune(&o)
+	}
+	m, err := mesh.Start(context.Background(), o)
+	if err != nil {
+		t.Fatalf("start node %s: %v", name, err)
+	}
+	n.mesh = m
+	t.Cleanup(func() { _ = m.Shutdown() })
 	return n
 }
 
-func (n *fakeMeshNode) addr() string { return strings.TrimPrefix(n.srv.URL, "http://") }
+// gateway is the real thing: a Fleet that has joined, behind the real
+// authentication and access-log middleware.
+type gateway struct {
+	fleet *fleet.Fleet
+	srv   *httptest.Server
+}
 
-func TestGatewayEndToEnd(t *testing.T) {
-	// A two-node heterogeneous mesh: one viiwork node and one nvidia-style
-	// node that serves no /chat. Both are seeded: view election (F3) now
-	// restricts eligibility to Seed nodes, so a viiwork reachable only by
-	// discovery could never be elected regardless of FullUI, which is not
-	// what this subtest is about — the model catalogue and gemma-routing
-	// subtests below still exercise discovery/transitive-peer behaviour via
-	// llama/nvidia's advertised dead peer.
-	//
-	// nvidia also advertises a dead peer alongside viiwork, giving it a
-	// strictly higher PeerCount (2) than viiwork's (1). That is deliberate:
-	// with FullUI honoured, viiwork still wins view election because it is
-	// the only node in the FullUI-requiring tier. But if a regression ever
-	// made election ignore FullUI, nvidia's higher PeerCount would win
-	// outright — a real, deterministic failure, not a coin flip on whichever
-	// node happens to get the lower ephemeral port from the OS.
-	viiwork := newMeshNode(t, []string{"gemma"}, true)
-	nvidia := newMeshNode(t, []string{"llama"}, false)
-	nvidia.peers = []string{viiwork.addr(), deadAddr}
-	viiwork.peers = []string{nvidia.addr()}
-
-	set, err := keys.Load([]string{"VIIWORK_KEY_integration=" + apiKey})
+func (g *gateway) do(t *testing.T, method, path, body string, withKey bool) *http.Response {
+	t.Helper()
+	var rdr io.Reader
+	if body != "" {
+		rdr = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, g.srv.URL+path, rdr)
 	if err != nil {
-		t.Fatalf("keys.Load: %v", err)
+		t.Fatalf("request: %v", err)
+	}
+	if withKey {
+		req.Header.Set("Authorization", "Bearer "+testKey)
+	}
+	resp, err := g.srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	return resp
+}
+
+func (g *gateway) body(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return string(b)
+}
+
+func startGateway(t *testing.T, nw *meshtest.Network, gossipPort int, seeds []string, tweak func(*config.Config)) *gateway {
+	t.Helper()
+
+	set, err := keys.Load([]string{"VIIWORK_KEY_test=" + testKey})
+	if err != nil {
+		t.Fatalf("keys: %v", err)
 	}
 
-	reg := mesh.New(mesh.Options{
-		Seeds:          []string{nvidia.addr(), viiwork.addr()},
-		Timeout:        2 * time.Second,
-		DiscoveryEvery: 1,
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	listenAddr := ln.Addr().String()
+	_ = ln.Close()
+
+	cfg := config.Config{
+		Listen:   listenAddr,
+		NodeName: "gw",
+		Mesh: config.MeshConfig{
+			Network: "tailnet", BindPort: gossipPort, Advertise: loopback,
+			Open: true, Enforce: "full", Seeds: seeds,
+			RejoinInterval: 300 * time.Millisecond,
+			CapacityPoll:   200 * time.Millisecond,
+			StaleAfter:     time.Second,
+		},
+		CookieTTL: time.Hour, MaxBody: 1 << 20,
+		MaxInFlight: 10000, BodyReadTimeout: 30 * time.Second,
+	}
+	if tweak != nil {
+		tweak(&cfg)
+	}
+
+	tr := nw.TransportAt("gw", netip.AddrPortFrom(loopback, uint16(gossipPort)))
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	fl, err := fleet.Start(context.Background(), fleet.Options{
+		Config: cfg, Version: "test", Log: io.Discard,
+		Logf: func(string, ...any) {},
+		MeshTune: func(o *mesh.Options) {
+			o.AddrCheck = func(netip.Addr) error { return nil }
+			o.Tune = fastTimings(tr)
+			o.Feeders = []mesh.Feeder{mesh.SeedFeeder(cfg.Mesh.Seeds)}
+		},
 	})
-	for i := 0; i < 3; i++ {
-		reg.Round(t.Context())
+	if err != nil {
+		t.Fatalf("start gateway: %v", err)
 	}
+	t.Cleanup(func() { _ = fl.Close(time.Second) })
 
-	// logBuf captures the access log so the "routes to the node owning the
-	// model" subtest below can assert on it directly, rather than trusting
-	// that a model and node were merely computed somewhere.
-	var logBuf syncBuffer
-	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
-
-	mw := &auth.Middleware{Keys: set, TTL: time.Hour}
+	mw := &auth.Middleware{Keys: set, TTL: cfg.CookieTTL}
 	handler := mw.Wrap(accesslog.Wrap(
-		proxy.NewRouter(reg, proxy.NewForwarder(logger), 1<<20, 10000, 30*time.Second, nil, logger),
+		proxy.NewRouter(fl, proxy.NewForwarder(logger), cfg.MaxBody, cfg.MaxInFlight,
+			cfg.BodyReadTimeout, nil, logger),
 		logger))
 
-	gw := httptest.NewServer(handler)
-	defer gw.Close()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	return &gateway{fleet: fl, srv: srv}
+}
 
-	get := func(path string, withKey bool) *http.Response {
-		t.Helper()
-		req, _ := http.NewRequest("GET", gw.URL+path, nil)
-		if withKey {
-			req.Header.Set("Authorization", "Bearer "+apiKey)
+func within(t *testing.T, d time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
 		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatalf("GET %s: %v", path, err)
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out after %v waiting for %s", d, what)
+}
+
+// twoNodes is the standard fixture: node-a with free slots, node-b without,
+// and a gateway that has joined and seen both.
+func twoNodes(t *testing.T, tweak func(*config.Config)) (*meshtest.Network, *node, *node, *gateway) {
+	t.Helper()
+	return twoNodesWith(t, model("m", 2, 0), model("m", 2, 2), tweak)
+}
+
+// twoNodesWith sets each node's capacity BEFORE the gateway starts polling, so
+// a test never races the first capacity poll: by the time the gateway can pick
+// a node at all, the numbers it is picking on are the ones the test asked for.
+func twoNodesWith(t *testing.T, aModel, bModel meshapi.ModelCapacity, tweak func(*config.Config)) (*meshtest.Network, *node, *node, *gateway) {
+	t.Helper()
+	nw := meshtest.NewNetwork()
+	a := startNode(t, nw, "node-a", 18946, nil)
+	b := startNode(t, nw, "node-b", 18947, func(o *mesh.Options) {
+		o.Seeds = []string{nw.Addr("node-a").String()}
+	})
+	a.setModels(aModel)
+	b.setModels(bModel)
+
+	gw := startGateway(t, nw, 18948, []string{
+		nw.Addr("node-a").String(), nw.Addr("node-b").String(),
+	}, tweak)
+	within(t, 5*time.Second, "the gateway to see both nodes", func() bool {
+		return gw.fleet.NumAlive() == 3
+	})
+	within(t, 3*time.Second, "a routable model", func() bool {
+		_, release, ok := gw.fleet.Pick("m", nil)
+		if ok {
+			release()
 		}
-		return resp
+		return ok
+	})
+	return nw, a, b, gw
+}
+
+// I1: the whole surface is behind a key, including the paths that would
+// otherwise be harmless.
+func TestIntegrationEveryPathNeedsAKey(t *testing.T) {
+	_, a, b, gw := twoNodes(t, nil)
+
+	for _, path := range []string{"/", "/mesh", "/v1/models", "/v1/aliases", "/v1/chat/completions"} {
+		resp := gw.do(t, "GET", path, "", false)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s: status = %d, want 401", path, resp.StatusCode)
+		}
+	}
+	if chatA, _ := a.counts(); chatA != 0 {
+		t.Errorf("node-a was reached %d times by unauthenticated requests", chatA)
+	}
+	if chatB, _ := b.counts(); chatB != 0 {
+		t.Errorf("node-b was reached %d times by unauthenticated requests", chatB)
+	}
+}
+
+// I2: the request lands on the node with free slots, and the gateway's own
+// credential does not travel with it.
+func TestIntegrationRoutesToTheFreestNode(t *testing.T) {
+	_, a, b, gw := twoNodes(t, nil)
+
+	resp := gw.do(t, "POST", "/v1/chat/completions", `{"model":"m"}`, true)
+	body := gw.body(t, resp)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "node-a") {
+		t.Errorf("answered by %q, want node-a", body)
+	}
+	chatA, _ := a.counts()
+	chatB, _ := b.counts()
+	if chatA != 1 || chatB != 0 {
+		t.Errorf("chat hits: node-a %d, node-b %d; want 1 and 0", chatA, chatB)
+	}
+	if leaks := a.leaks(); len(leaks) != 0 {
+		t.Errorf("credentials reached node-a: %v", leaks)
+	}
+}
+
+// I3: a burst spreads. Capacity reports are a snapshot, so without local
+// reservations every request in a burst would be sent at the same free slot.
+func TestIntegrationBurstSpreadsAcrossNodes(t *testing.T) {
+	// Both nodes report two free slots from the start, so the burst is
+	// measured against the numbers this test intends rather than whatever the
+	// first capacity poll happened to catch.
+	_, a, b, gw := twoNodesWith(t, model("m", 2, 0), model("m", 2, 0), nil)
+	a.setHold(200 * time.Millisecond)
+	b.setHold(200 * time.Millisecond)
+
+	// node-b must have been polled at least once, or node-a is the only
+	// candidate and the spread has nothing to spread over.
+	within(t, 3*time.Second, "node-b to have reported", func() bool {
+		target, release, ok := gw.fleet.Pick("m", map[string]bool{"node-a": true})
+		if ok {
+			release()
+		}
+		return ok && target.Node == "node-b"
+	})
+
+	var wg sync.WaitGroup
+	for range 6 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp := gw.do(t, "POST", "/v1/chat/completions", `{"model":"m"}`, true)
+			resp.Body.Close()
+		}()
+	}
+	wg.Wait()
+
+	chatA, _ := a.counts()
+	chatB, _ := b.counts()
+	if chatA+chatB != 6 {
+		t.Fatalf("nodes saw %d requests in total, want 6", chatA+chatB)
+	}
+	if chatA < 2 || chatB < 2 {
+		t.Errorf("burst landed %d on node-a and %d on node-b; each should take "+
+			"at least 2 of 6 when both report two free slots", chatA, chatB)
+	}
+}
+
+// I4: a node that vanishes stops receiving traffic once its report goes stale.
+func TestIntegrationRoutesAwayFromAVanishedNode(t *testing.T) {
+	nw, a, b, gw := twoNodes(t, nil)
+	b.setModels(model("m", 2, 0))
+
+	nw.Unplug("node-a")
+	within(t, 4*time.Second, "node-b to be the only candidate", func() bool {
+		target, release, ok := gw.fleet.Pick("m", nil)
+		if ok {
+			release()
+		}
+		return ok && target.Node == "node-b"
+	})
+
+	beforeA, _ := a.counts()
+	resp := gw.do(t, "POST", "/v1/chat/completions", `{"model":"m"}`, true)
+	body := gw.body(t, resp)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "node-b") {
+		t.Errorf("answered by %q, want node-b", body)
+	}
+	if afterA, _ := a.counts(); afterA != beforeA {
+		t.Errorf("the unplugged node still received %d requests", afterA-beforeA)
+	}
+}
+
+// I5: an alias is not in any capacity report. The gateway holds no alias
+// table, so the view node resolves it.
+func TestIntegrationUnknownModelGoesToTheViewNode(t *testing.T) {
+	_, a, _, gw := twoNodes(t, func(c *config.Config) {
+		c.ViewNodes = []string{"node-a"}
+	})
+
+	resp := gw.do(t, "POST", "/v1/chat/completions", `{"model":"stable-coder"}`, true)
+	body := gw.body(t, resp)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "node-a") {
+		t.Errorf("answered by %q, want the view node node-a", body)
+	}
+	if chatA, _ := a.counts(); chatA != 1 {
+		t.Errorf("view node saw %d chat requests, want 1", chatA)
+	}
+}
+
+// I6: alias writes are refused at the gateway, and never reach a node.
+func TestIntegrationAliasWritesRefused(t *testing.T) {
+	_, a, b, gw := twoNodes(t, nil)
+
+	for _, c := range []struct{ method, path string }{
+		{"PUT", "/v1/aliases/stable-coder"},
+		{"POST", "/v1/aliases/stable-coder/revert"},
+	} {
+		resp := gw.do(t, c.method, c.path, `{"target":"m"}`, true)
+		body := gw.body(t, resp)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s %s: status = %d, want 403", c.method, c.path, resp.StatusCode)
+		}
+		if !strings.Contains(body, "forbidden_path") {
+			t.Errorf("%s %s: body %q should carry forbidden_path", c.method, c.path, body)
+		}
+	}
+	if len(a.leaks())+len(b.leaks()) != 0 {
+		t.Error("a refused alias write still reached a node")
+	}
+}
+
+// I7: reading the alias table is what the dashboards do, and it works.
+func TestIntegrationAliasReadReachesTheViewNode(t *testing.T) {
+	_, _, _, gw := twoNodes(t, func(c *config.Config) {
+		c.ViewNodes = []string{"node-b"}
+	})
+
+	resp := gw.do(t, "GET", "/v1/aliases", "", true)
+	body := gw.body(t, resp)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if !strings.Contains(body, "stable-coder") || !strings.Contains(body, "node-b") {
+		t.Errorf("body = %q, want the view node's alias table", body)
+	}
+}
+
+// I8: chassis power stays a tailnet capability. Switching a machine off is
+// the one thing an API key must never buy.
+func TestIntegrationPowerPathsRefused(t *testing.T) {
+	_, a, b, gw := twoNodes(t, nil)
+
+	for _, path := range []string{"/v1/power", "/v1/mesh/power", "//v1/power", "/v1/./power"} {
+		resp := gw.do(t, "POST", path, `{"action":"off"}`, true)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s: status = %d, want 403", path, resp.StatusCode)
+		}
+	}
+	_, powerA := a.counts()
+	_, powerB := b.counts()
+	if powerA != 0 || powerB != 0 {
+		t.Errorf("power endpoints were reached: node-a %d, node-b %d", powerA, powerB)
+	}
+}
+
+// I9: the bare hostname serves the fleet-wide mesh view, with the gateway's
+// own security headers over whatever the node sent.
+func TestIntegrationLandingServesTheMeshView(t *testing.T) {
+	_, _, _, gw := twoNodes(t, func(c *config.Config) {
+		c.ViewNodes = []string{"node-a"}
+	})
+
+	resp := gw.do(t, "GET", "/", "", true)
+	body := gw.body(t, resp)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if !strings.Contains(body, "served by node-a") {
+		t.Errorf("body = %q, want the node's /mesh page", body)
+	}
+	if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+	if resp.Header.Get("Content-Security-Policy") == "" {
+		t.Error("the mesh view was served without a Content-Security-Policy")
+	}
+}
+
+// I10: in an open mesh the operator names the nodes allowed to serve
+// dashboards, and that allowlist is authoritative — the view does not fall
+// back to another node when the named one goes away.
+func TestIntegrationViewAllowlistIsAuthoritative(t *testing.T) {
+	nw, _, _, gw := twoNodes(t, func(c *config.Config) {
+		c.ViewNodes = []string{"node-b"}
+	})
+
+	resp := gw.do(t, "GET", "/", "", true)
+	body := gw.body(t, resp)
+	if !strings.Contains(body, "served by node-b") {
+		t.Fatalf("body = %q, want node-b although node-a sorts first", body)
 	}
 
-	// sessionCookie is captured by the bootstrap subtest below and reused by
-	// the cookie-authenticated inference subtest, so the subtests must run
-	// in this order (t.Run executes them sequentially, not in parallel).
-	var sessionCookie *http.Cookie
-
-	t.Run("unauthenticated is refused", func(t *testing.T) {
-		resp := get("/v1/models", false)
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("status = %d, want 401", resp.StatusCode)
-		}
+	nw.Unplug("node-b")
+	within(t, 4*time.Second, "the view node to go away", func() bool {
+		_, ok := gw.fleet.View()
+		return !ok
 	})
 
-	t.Run("catalogue is the union of a discovered mesh", func(t *testing.T) {
-		resp := get("/v1/models", true)
-		defer resp.Body.Close()
+	resp = gw.do(t, "GET", "/", "", true)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("/ with no eligible view node: status = %d, want 503", resp.StatusCode)
+	}
 
-		var list struct {
-			Data []struct {
-				ID string `json:"id"`
-			} `json:"data"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		ids := map[string]bool{}
-		for _, e := range list.Data {
-			ids[e.ID] = true
-		}
-		if !ids["gemma"] || !ids["llama"] {
-			t.Fatalf("models = %v, want both gemma and llama (both seeded)", ids)
-		}
-		if len(ids) != 2 {
-			t.Fatalf("models = %v, want exactly {gemma, llama}: a dead peer must contribute no model", ids)
-		}
-	})
+	// Inference is unaffected: node-a still serves the model.
+	resp = gw.do(t, "POST", "/v1/chat/completions", `{"model":"m"}`, true)
+	body = gw.body(t, resp)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "node-a") {
+		t.Errorf("chat: status = %d body = %q, want 200 from node-a", resp.StatusCode, body)
+	}
+}
 
-	t.Run("a peer-advertised node that never answers stays unroutable", func(t *testing.T) {
-		if n := reg.Snapshot().Node(deadAddr); n != nil && n.Healthy {
-			t.Fatalf("dead peer address %s became healthy despite never answering a status poll", deadAddr)
-		}
-		if view, _ := reg.ViewAddr(); view == deadAddr {
-			t.Fatalf("dead peer address %s was elected view node", deadAddr)
-		}
-	})
+// I11: a secured gateway cannot join an open mesh, and says so honestly
+// rather than routing into a mesh it never joined.
+func TestIntegrationSecuredGatewayAgainstOpenNodes(t *testing.T) {
+	nw := meshtest.NewNetwork()
+	a := startNode(t, nw, "node-a", 18946, nil)
+	a.setModels(model("m", 2, 0))
 
-	t.Run("browser bootstrap issues a cookie", func(t *testing.T) {
-		client := &http.Client{
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		}
-		resp, err := client.Get(gw.URL + "/mesh?key=" + apiKey)
-		if err != nil {
-			t.Fatalf("GET: %v", err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusSeeOther {
-			t.Fatalf("status = %d, want 303", resp.StatusCode)
-		}
-		cookies := resp.Cookies()
-		if len(cookies) != 1 {
-			t.Fatalf("got %d cookies, want 1", len(cookies))
-		}
-		if strings.Contains(resp.Header.Get("Location"), "key=") {
-			t.Error("the redirect still carries the key")
-		}
-		sessionCookie = cookies[0]
-	})
+	gw := startGateway(t, nw, 18948, []string{nw.Addr("node-a").String()},
+		func(c *config.Config) {
+			c.Mesh.Open = false
+			c.Mesh.SecretKey = make([]byte, 32)
+		})
 
-	t.Run("routes to the node owning the model", func(t *testing.T) {
-		req, _ := http.NewRequest("POST", gw.URL+meshapi.PathChatCompletions,
-			strings.NewReader(`{"model":"gemma","messages":[]}`))
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatalf("POST: %v", err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("status = %d, want 200 (a 500 means a credential leaked upstream)", resp.StatusCode)
-		}
-		select {
-		case which := <-viiwork.served:
-			if which != "gemma" {
-				t.Fatalf("served by %q, want the gemma owner", which)
-			}
-		case <-time.After(time.Second):
-			t.Fatal("the gemma request never reached the node that owns gemma")
-		}
+	time.Sleep(2 * time.Second)
 
-		// The spec's stated reason for labelled keys is that the access log
-		// shows which key sent how much traffic to which node serving which
-		// model. Router computes the model and node several layers below
-		// accesslog.Wrap; this is the seam a passing unit test in either
-		// package alone would not catch — only an end-to-end request through
-		// the real handler chain proves the value actually reaches the log
-		// line, not just some context a downstream package never reads back.
-		//
-		// accesslog.Wrap logs after the handler chain returns, which — with
-		// FlushInterval: -1 streaming response bytes to the client as they
-		// arrive — can genuinely land a moment after the client already has
-		// its response, so this polls rather than checking once.
-		deadline := time.Now().Add(time.Second)
-		var lastLog string
-		for {
-			lastLog = logBuf.String()
-			found := false
-			var loggedNode string
-			for _, line := range strings.Split(strings.TrimSpace(lastLog), "\n") {
-				var entry struct {
-					Path  string `json:"path"`
-					Model string `json:"model"`
-					Node  string `json:"node"`
-				}
-				if err := json.Unmarshal([]byte(line), &entry); err != nil {
-					continue
-				}
-				if entry.Path == meshapi.PathChatCompletions && entry.Model == "gemma" {
-					found = true
-					loggedNode = entry.Node
-					break
-				}
-			}
-			if found {
-				if loggedNode != viiwork.addr() {
-					t.Fatalf("log line node = %q, want the gemma owner %s", loggedNode, viiwork.addr())
-				}
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("no access log line recorded model=gemma for %s; log:\n%s",
-					meshapi.PathChatCompletions, lastLog)
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-	})
+	resp := gw.do(t, "POST", "/v1/chat/completions", `{"model":"m"}`, true)
+	body := gw.body(t, resp)
 
-	t.Run("routes to the node owning a model only the non-view node serves", func(t *testing.T) {
-		// gemma's owner (viiwork) is also the elected view node, so a
-		// regression that forwards every inference request to ViewAddr()
-		// instead of the model's actual owner would still pass the gemma
-		// case above. llama is owned only by nvidia, which is NOT the view
-		// node, so this is the request shape that actually distinguishes
-		// "routed by model ownership" from "routed to the dashboard node".
-		req, _ := http.NewRequest("POST", gw.URL+meshapi.PathChatCompletions,
-			strings.NewReader(`{"model":"llama","messages":[]}`))
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatalf("POST: %v", err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("status = %d, want 200 (a 500 means a credential leaked upstream)", resp.StatusCode)
-		}
-		select {
-		case which := <-nvidia.served:
-			if which != "llama" {
-				t.Fatalf("served by %q, want the llama owner", which)
-			}
-		case <-time.After(time.Second):
-			t.Fatal("the llama request never reached the node that owns llama")
-		}
-	})
-
-	t.Run("a cookie-authenticated request never leaks the cookie to the mesh", func(t *testing.T) {
-		// stripCredentials deletes both Authorization and Cookie in one
-		// place, but every other proxied request in this suite authenticates
-		// with a bearer token, so a regression that stopped stripping ONLY
-		// the Cookie header would otherwise sail through undetected. This
-		// request carries a cookie and no Authorization header at all; the
-		// fake node's 500-on-Cookie trap makes a 200 here proof the gateway
-		// stripped it.
-		if sessionCookie == nil {
-			t.Fatal("no session cookie captured by the bootstrap subtest")
-		}
-		req, _ := http.NewRequest("POST", gw.URL+meshapi.PathChatCompletions,
-			strings.NewReader(`{"model":"gemma","messages":[]}`))
-		req.AddCookie(sessionCookie)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatalf("POST: %v", err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("status = %d, want 200 (a 500 means the gateway's own cookie leaked upstream)", resp.StatusCode)
-		}
-		select {
-		case which := <-viiwork.served:
-			if which != "gemma" {
-				t.Fatalf("served by %q, want the gemma owner", which)
-			}
-		case <-time.After(time.Second):
-			t.Fatal("the cookie-authenticated request never reached the node that owns gemma")
-		}
-	})
-
-	t.Run("dashboard goes to the node with the full UI", func(t *testing.T) {
-		view, ok := reg.ViewAddr()
-		if !ok {
-			t.Fatal("no view node elected")
-		}
-		if view != viiwork.addr() {
-			t.Fatalf("view = %s, want the full-surface node %s", view, viiwork.addr())
-		}
-		resp := get("/mesh", true)
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("status = %d, want 200", resp.StatusCode)
-		}
-	})
-
-	t.Run("chassis power is refused", func(t *testing.T) {
-		req, _ := http.NewRequest("POST", gw.URL+meshapi.PathMeshPower, strings.NewReader("{}"))
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatalf("POST: %v", err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusForbidden {
-			t.Fatalf("status = %d, want 403", resp.StatusCode)
-		}
-		// A 403 alone is only safe by accident: the fake nodes registered no
-		// power handler before this fix would have turned a fall-through
-		// into a 404, not a 403. Now that both nodes record a hit, prove no
-		// node was ever contacted at all.
-		select {
-		case hit := <-viiwork.powerHit:
-			t.Fatalf("viiwork node received a power request it should never have seen: %s", hit)
-		default:
-		}
-		select {
-		case hit := <-nvidia.powerHit:
-			t.Fatalf("nvidia node received a power request it should never have seen: %s", hit)
-		default:
-		}
-	})
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (%s)", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "no_healthy_node") {
+		t.Errorf("body = %q, want no_healthy_node", body)
+	}
+	if chat, _ := a.counts(); chat != 0 {
+		t.Errorf("the open node was reached %d times by a secured gateway", chat)
+	}
 }

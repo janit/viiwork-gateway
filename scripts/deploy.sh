@@ -110,12 +110,22 @@ fi
 #
 # `up -d --build` builds first and only then recreates the container, so the
 # outage is a container restart rather than a whole image build. It is still an
-# outage: any in-flight completion or SSE stream is cut. There is no viiwork
-# node behind this that cares, and a gateway restart is seconds, so this is not
-# worth a blue/green dance — but do not run it mid-generation and be surprised.
+# outage: any in-flight completion or SSE stream is cut.
+#
+# The gateway is a mesh member now, so a restart is visible to the fleet too.
+# Compose stops the container with SIGTERM, which drains HTTP and then leaves
+# the mesh, so every node sees it go at once rather than declaring it dead a
+# failure-detector interval later — and sees it rejoin seconds afterwards. No
+# node depends on the gateway (nothing polls it), so this is still not worth a
+# blue/green dance — but do not run it mid-generation and be surprised.
 
+#
+# VERSION is what the Dockerfile stamps into the binary with -X main.version.
+# It is not cosmetic: the gateway gossips its version in its mesh metadata, so
+# an unstamped build calls itself "dev" on every node's member list as well as
+# in its own startup log.
 info "Building and restarting"
-docker compose up -d --build
+VERSION="$TARGET" docker compose up -d --build
 
 # ── Health ──────────────────────────────────────────────────────────────────
 #
@@ -185,9 +195,16 @@ if [[ "$COUNT" -gt 0 ]]; then
 else
   # Up but seeing nothing is a real state worth distinguishing: the gateway is
   # fine and the fleet is not, so redeploying it will not help.
-  warn "Deployed $TARGET — gateway is up, but /v1/models is empty."
-  echo "  That points at the mesh, not the gateway: no seed reachable, or every"
-  echo "  node down. Check 'docker compose logs' and the nodes themselves."
+  warn "Deployed $TARGET — gateway is up, but /v1/models returned no models."
+  echo "  That points at membership, not at the gateway. In order of likelihood:"
+  echo "    - it has only just joined and no capacity report has landed yet;"
+  echo "      re-run the check in a few seconds before believing this"
+  echo "    - the mesh secret does not match the nodes (a secured gateway"
+  echo "      cannot join an open mesh, or vice versa)"
+  echo "    - gossip cannot reach the fleet: 7946 tcp+udp both ways"
+  echo "    - VIIWORK_GW_VIEW_NODES names no node that is currently alive"
+  echo "    - every node is genuinely down"
+  echo "  'docker compose logs' shows which members it can see."
 fi
 
 # Only worth saying when there is somewhere to go back TO: on --redeploy the

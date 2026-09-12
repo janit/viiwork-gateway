@@ -1,4 +1,4 @@
-.PHONY: build test race docker up down deploy clean
+.PHONY: build test race integration docker up down deploy clean
 
 build:
 	go build -trimpath -o bin/viiwork-gateway ./cmd/viiwork-gateway

@@ -17,3 +17,7 @@ docs/security/.hardening-ledger.md
 # keeps `git status` clean enough for the publish pre-flight to run at all.
 .serena/
 .superpowers/
+
+# Go workspace, if developing against an unpublished viiwork 2 checkout.
+go.work
+go.work.sum
