@@ -56,6 +56,16 @@ rather than half-defended in code.
       that run as long as a generation takes, and a write deadline truncates
       real inference mid-answer. (Same reason the gateway sets
       `WriteTimeout: 0`.)
+
+      The shipped Caddyfile also sends `Strict-Transport-Security`
+      (`max-age=31536000; includeSubDomains`). The gateway is HTTPS-only —
+      its session cookie is `Secure` — and HSTS is what closes the
+      first-visit downgrade gap the HTTP->HTTPS redirect leaves open. It is
+      deliberately not `preload`d: preload is a domain-wide, hard-to-reverse
+      commitment, not one service's to make. Confirm the header actually
+      lands (`curl -sI https://<host>/ | grep -i strict-transport`); if you
+      merged this Caddyfile's directives into an existing site block rather
+      than importing it whole, it is easy to drop.
 - [ ] **Generate one strong key per client.** `openssl rand -base64 32`, one
       `VIIWORK_KEY_<label>` per consumer. The label lands in the access log, so
       you can attribute and revoke per client. Minimum length is enforced (24
@@ -98,6 +108,16 @@ control that matters. In your tailnet policy:
 - `VIIWORK_GW_MAX_INFLIGHT` (default 256) — concurrent proxied requests. Worst-
   case memory ≈ this × `VIIWORK_GW_MAX_BODY`. Lower it if the host has little
   RAM (256 × 16MB ≈ 4GB worst case).
+
+  One budget covers everything the gateway forwards, and that includes the
+  dashboards: `/` and `/v1/mesh/stream` hold a token for the whole life of
+  their (often long-lived, SSE) connection, released when the browser
+  disconnects. So open dashboard tabs and inference draw from the same 256.
+  For a handful of clients this is invisibly generous; if you expect many
+  simultaneous dashboard viewers, or you lower this for a small host, size it
+  with both in mind. A key holder can also hold connections open
+  deliberately — but a key holder is already trusted to read all traffic, so
+  this changes nothing about the trust model, only the capacity arithmetic.
 - `VIIWORK_GW_BODY_READ_TIMEOUT` (default 30s) — how long a request body may
   take to arrive before a `408`. Long enough for a real prompt on a slow link;
   short enough to stop a slow-body hang. Does not affect long generations.

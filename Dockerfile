@@ -1,4 +1,4 @@
-# Build stage. GOTOOLCHAIN=auto lets the pinned Go 1.27.0 be fetched even when
+# Build stage. GOTOOLCHAIN=auto lets the pinned Go 1.27.1 be fetched even when
 # the base image ships something older.
 FROM golang:1.27-alpine AS build
 WORKDIR /src

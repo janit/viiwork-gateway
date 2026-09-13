@@ -2,6 +2,8 @@
 
 An API-key-protected HTTPS gateway that exposes a [viiwork 2](https://github.com/janit/viiwork) mesh outside its tailnet, on one port, behind Caddy.
 
+**Requires a viiwork 2.x mesh.** The gateway gossips the v2 protocol and a v1 node is simply invisible to it — there is no partial mode, so a fleet converts together. Any viiwork 2.x release will do: the compatibility is the major, not the number. `github.com/janit/viiwork/v2` in `go.mod` is the precise, tooling-enforced statement of which protocol a given build speaks, which is why that boundary is not also encoded in the tag. The gateway's own version is about the gateway — its configuration surface, authentication behaviour and HTTP API — and moves on its own line.
+
 A viiwork node's HTTP API has no authentication of its own — by design, for trusted local networks. (viiwork 2 can authenticate *membership* with a shared mesh secret, which is a different thing: it decides who may join the mesh, not who may call a node's API. Anyone who can reach the port can still call it.) This gateway is what makes reaching the mesh from the internet reasonable: every request needs a key, credentials never reach the nodes, and chassis power control and alias writes are refused outright.
 
 ## What it does

@@ -59,6 +59,19 @@
 }
 
 gw.example.com {
+	# HSTS. The gateway's whole model is HTTPS-only: the session cookie is
+	# Secure, so it never travels over plain HTTP. HSTS is what closes the
+	# first-visit gap — without it, a network attacker can downgrade the very
+	# first request before Caddy's HTTP->HTTPS redirect fires, and strip the
+	# connection. One year, and includeSubDomains because nothing under this
+	# host should ever be plain HTTP.
+	#
+	# Deliberately NOT `preload`. Preload is a hard commitment baked into
+	# browsers that is slow and painful to undo, and it belongs to whoever
+	# owns the apex domain, not to this one service. Add `preload` and submit
+	# to hstspreload.org only as a domain-wide decision.
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
 	# Backstop for the gateway's own VIIWORK_GW_MAX_BODY (default 16MB).
 	# Deliberately set ABOVE it, so an oversized body is normally rejected by
 	# the gateway with its OpenAI-shaped 413 that clients can parse, and only
