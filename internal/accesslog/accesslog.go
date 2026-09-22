@@ -75,28 +75,47 @@ func Wrap(next http.Handler, logger *slog.Logger) http.Handler {
 		info := &proxy.RequestInfo{}
 		r = r.WithContext(proxy.ContextWithRequestInfo(r.Context(), info))
 
-		next.ServeHTTP(rec, r)
+		// Logged from a defer, because a stream that fails after its first
+		// byte does not return: ReverseProxy aborts it by panicking with
+		// http.ErrAbortHandler. A flag rather than recover() tells the two
+		// apart, so a panic carries on to net/http with its own stack intact.
+		completed := false
+		defer func() {
+			logRequest(logger, r, rec, info, start, !completed)
+		}()
 
-		if rec.status == 0 {
-			rec.status = http.StatusOK
-		}
-		attrs := []any{
-			"method", r.Method,
-			"path", r.URL.Path,
-			"status", rec.status,
-			"bytes", rec.bytes,
-			"duration_ms", time.Since(start).Milliseconds(),
-			"remote", clientip.From(r),
-		}
-		if label := auth.LabelFromContext(r.Context()); label != "" {
-			attrs = append(attrs, "key", label)
-		}
-		if info.Model != "" {
-			attrs = append(attrs, "model", info.Model)
-		}
-		if info.Node != "" {
-			attrs = append(attrs, "node", info.Node)
-		}
-		logger.Info("request", attrs...)
+		next.ServeHTTP(rec, r)
+		completed = true
 	})
+}
+
+// logRequest writes the one line for a finished request. aborted marks a
+// request whose handler never returned — a client that hung up mid-stream, or
+// a node that died mid-generation — so status and bytes are what was sent
+// before the connection went.
+func logRequest(logger *slog.Logger, r *http.Request, rec *recorder, info *proxy.RequestInfo, start time.Time, aborted bool) {
+	if rec.status == 0 {
+		rec.status = http.StatusOK
+	}
+	attrs := []any{
+		"method", r.Method,
+		"path", r.URL.Path,
+		"status", rec.status,
+		"bytes", rec.bytes,
+		"duration_ms", time.Since(start).Milliseconds(),
+		"remote", clientip.From(r),
+	}
+	if label := auth.LabelFromContext(r.Context()); label != "" {
+		attrs = append(attrs, "key", label)
+	}
+	if info.Model != "" {
+		attrs = append(attrs, "model", info.Model)
+	}
+	if info.Node != "" {
+		attrs = append(attrs, "node", info.Node)
+	}
+	if aborted {
+		attrs = append(attrs, "aborted", true)
+	}
+	logger.Info("request", attrs...)
 }

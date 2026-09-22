@@ -118,7 +118,12 @@ func TestRouterModelsCatalogueTakesAnInFlightToken(t *testing.T) {
 	var releaseOnce sync.Once
 	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
 
+	// The router takes its token before it forwards, so the upstream being
+	// reached is proof the token is held.
+	arrived := make(chan struct{})
+	var arrivedOnce sync.Once
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrivedOnce.Do(func() { close(arrived) })
 		<-release
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -129,16 +134,13 @@ func TestRouterModelsCatalogueTakesAnInFlightToken(t *testing.T) {
 
 	rt := newTestRouterWithMaxInFlight(t, upstream, 1)
 
-	holding := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		rec := httptest.NewRecorder()
-		close(holding)
 		rt.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gemma"}`)))
 	}()
-	<-holding
-	time.Sleep(50 * time.Millisecond) // let the goroutine acquire and block in the upstream call
+	<-arrived
 
 	rec := httptest.NewRecorder()
 	rt.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
@@ -162,30 +164,31 @@ func TestRouterModelsCatalogueTakesAnInFlightToken(t *testing.T) {
 // a 503) even when every token is held.
 func TestRouterPowerDenyNotGatedByInFlightCap(t *testing.T) {
 	release := make(chan struct{})
+	arrived := make(chan struct{})
+	var arrivedOnce sync.Once
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrivedOnce.Do(func() { close(arrived) })
 		<-release
 		w.WriteHeader(http.StatusOK)
 	}))
+	// Ordered so the blocked upstream is let go before Close waits on it,
+	// even when the assertion below fails.
 	defer upstream.Close()
+	defer close(release)
 
 	rt := newTestRouterWithMaxInFlight(t, upstream, 1)
 
-	holding := make(chan struct{})
 	go func() {
 		rec := httptest.NewRecorder()
-		close(holding)
 		rt.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gemma"}`)))
 	}()
-	<-holding
-	time.Sleep(50 * time.Millisecond)
+	<-arrived
 
 	rec := httptest.NewRecorder()
 	rt.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/power", strings.NewReader("{}")))
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("/v1/power while cap exhausted: status = %d, want 403 (must not be gated by the cap)", rec.Code)
 	}
-
-	close(release)
 }
 
 // TestRouterInFlightTokenReleasedOnUpstreamError proves a request that ends

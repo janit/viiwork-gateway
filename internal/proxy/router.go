@@ -114,6 +114,18 @@ func NewRouter(fl Fleet, fwd *Forwarder, maxBody int64, maxInFlight int, bodyRea
 	}
 }
 
+// forwardHolding forwards r to addr while holding a picker reservation, and
+// gives the reservation back however the forward ends. That includes the
+// http.ErrAbortHandler panic ReverseProxy uses to abort a stream that fails
+// after its first byte — a client hanging up, or a node dying mid-generation —
+// which a release placed after the call would never reach. The release is
+// deferred here rather than in routeByModel so that the first reservation is
+// still given back before the retry's Pick, not held across it.
+func (rt *Router) forwardHolding(w http.ResponseWriter, r *http.Request, addr string, release func()) error {
+	defer release()
+	return rt.fwd.To(w, r, addr)
+}
+
 // tryAcquire attempts to take a concurrency token without blocking. It
 // returns a release func to call exactly once (via defer) when the caller
 // is done, and false if the cap is currently exhausted — in which case no
@@ -362,8 +374,7 @@ func (rt *Router) routeByModel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rt.setNode(r, target.Node)
-	err = rt.fwd.To(w, r, target.APIAddr)
-	release()
+	err = rt.forwardHolding(w, r, target.APIAddr, release)
 	if !errors.Is(err, ErrUpstreamUnreachable) {
 		// Either it worked, or it failed in a way that has already been
 		// written to the client. A node's own 429 or 503 arrives here as a
@@ -386,8 +397,7 @@ func (rt *Router) routeByModel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rt.setNode(r, second.Node)
-	err = rt.fwd.To(w, r, second.APIAddr)
-	releaseSecond()
+	err = rt.forwardHolding(w, r, second.APIAddr, releaseSecond)
 	if errors.Is(err, ErrUpstreamUnreachable) {
 		writeUnreachable(w, second.Node)
 	}

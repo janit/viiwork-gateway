@@ -212,3 +212,54 @@ func TestRecorderUnwrapReachesUnderlyingDeadlineSetter(t *testing.T) {
 		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, body)
 	}
 }
+
+// A stream that fails after its first byte ends with ReverseProxy panicking
+// http.ErrAbortHandler. The request still happened, and a stream a client
+// abandoned is exactly the kind worth seeing in the log: it must be recorded,
+// marked as aborted, and the panic must carry on up to net/http unchanged.
+func TestAbortedRequestIsStillLogged(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("data: tok\n\n"))
+		panic(http.ErrAbortHandler)
+	})
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		Wrap(next, logger).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/v1/chat/completions", nil))
+	}()
+
+	if recovered != http.ErrAbortHandler {
+		t.Errorf("panic = %v, want http.ErrAbortHandler passed through", recovered)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
+		t.Fatalf("no log line for the aborted request: %v (%q)", err, buf.String())
+	}
+	if entry["aborted"] != true {
+		t.Errorf("aborted = %v, want true", entry["aborted"])
+	}
+	if entry["bytes"] != float64(11) {
+		t.Errorf("bytes = %v, want 11: what was sent before the abort", entry["bytes"])
+	}
+}
+
+// A request that completes normally carries no aborted field at all.
+func TestCompletedRequestIsNotMarkedAborted(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	})
+	Wrap(next, logger).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil))
+
+	var entry map[string]any
+	_ = json.Unmarshal(buf.Bytes(), &entry)
+	if _, ok := entry["aborted"]; ok {
+		t.Errorf("aborted = %v on a completed request, want absent", entry["aborted"])
+	}
+}

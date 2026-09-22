@@ -351,3 +351,114 @@ func TestModelsCatalogueIsNotRateLimited(t *testing.T) {
 		}
 	}
 }
+
+// waitForReleases polls until the fleet has had want reservations given back.
+// The handler runs on the server's goroutine, so the client returning is not
+// proof that the handler has.
+func waitForReleases(t *testing.T, fl *fakeFleet, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for fl.releaseCount() < want && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := fl.releaseCount(); got != want {
+		t.Errorf("releases = %d, want %d: a reservation was leaked", got, want)
+	}
+}
+
+// streamThenDie sends one SSE event and then drops the connection, the way a
+// node that crashes mid-generation does.
+func streamThenDie() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: tok\n\n"))
+		w.(http.Flusher).Flush()
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+}
+
+func postChat(t *testing.T, gw *httptest.Server) {
+	t.Helper()
+	resp, err := http.Post(gw.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"gemma","stream":true}`))
+	if err != nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+}
+
+// RT9: once a stream has started, a failure makes ReverseProxy abort the
+// handler by panicking with http.ErrAbortHandler — only under a real
+// http.Server, which is why these tests use one and not a ResponseRecorder.
+// The reservation must still be given back, or Picker.held grows by one entry
+// per aborted stream, for ever.
+func TestRouteByModelReleasesWhenUpstreamDiesMidStream(t *testing.T) {
+	upstream := streamThenDie()
+	defer upstream.Close()
+
+	fl := oneNodeFleet("node-a", addrOf(upstream))
+	gw := httptest.NewServer(fleetRouter(fl))
+	defer gw.Close()
+
+	postChat(t, gw)
+	waitForReleases(t, fl, 1)
+}
+
+// RT10: the same for a client that hangs up mid-stream — a "stop generating"
+// button, the commonest way a stream ends early.
+func TestRouteByModelReleasesWhenClientHangsUpMidStream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		for {
+			if _, err := w.Write([]byte("data: tok\n\n")); err != nil {
+				return
+			}
+			w.(http.Flusher).Flush()
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}))
+	defer upstream.Close()
+
+	fl := oneNodeFleet("node-a", addrOf(upstream))
+	gw := httptest.NewServer(fleetRouter(fl))
+	defer gw.Close()
+
+	resp, err := http.Post(gw.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"gemma","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1)
+	if _, err := resp.Body.Read(buf); err != nil {
+		t.Fatalf("no first byte: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	waitForReleases(t, fl, 1)
+}
+
+// RT11: the retry's reservation is released on the same path.
+func TestRouteByModelReleasesRetryWhenItDiesMidStream(t *testing.T) {
+	upstream := streamThenDie()
+	defer upstream.Close()
+
+	fl := &fakeFleet{targets: []fleet.Target{
+		{Node: "node-a", APIAddr: closedPort(t)},
+		{Node: "node-b", APIAddr: addrOf(upstream)},
+	}}
+	gw := httptest.NewServer(fleetRouter(fl))
+	defer gw.Close()
+
+	postChat(t, gw)
+	waitForReleases(t, fl, 2)
+}

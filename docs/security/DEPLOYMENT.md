@@ -182,7 +182,9 @@ control that matters. In your tailnet policy:
       line, deliberately — a key hammering its limit would double its own log
       volume). A steady trickle of 429s from one `key=` label is either a
       client that needs a higher limit or a key being abused; the label tells
-      you which one to go ask.
+      you which one to go ask. A line with `aborted=true` is a stream that
+      ended early — the client hung up, or the node died mid-generation — and
+      its `status` and `bytes` are what was sent before it did.
 - [ ] Consider fail2ban (or equivalent) on `authentication rejected` lines.
       Unauthenticated brute force is the one thing better dropped before it
       reaches the gateway at all, and the log already carries the source IP.

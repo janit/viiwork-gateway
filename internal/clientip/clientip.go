@@ -19,7 +19,11 @@ func From(r *http.Request) string {
 	// replacing it. The client can send its own X-Forwarded-For, and Caddy appends
 	// to that, so the format is "<client-claimed>, <client-claimed>, <caddy-observed>".
 	// Only the rightmost entry is trustworthy; leftmost entries are attacker-controlled.
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+	//
+	// Repeated header lines are one list (RFC 9110 §5.3), so they are joined
+	// first: Header.Get would return only the first line, which is the
+	// client's own.
+	if fwd := strings.Join(r.Header.Values("X-Forwarded-For"), ","); fwd != "" {
 		// Split on comma and take the rightmost non-empty entry.
 		entries := strings.Split(fwd, ",")
 		for i := len(entries) - 1; i >= 0; i-- {
